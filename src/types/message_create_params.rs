@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     CacheControlEphemeral, CompactionRequest, Container, ContextManagement, DiagnosticsRequest,
     FallbackConfig, Fallbacks, InferenceSpeed, McpServer, MessageParam, Metadata, Model,
-    OutputConfig, ServiceTierChoice, SystemPrompt, TextBlock, ThinkingConfig, ThinkingDisplay,
+    OutputConfig, ServiceTierChoice, SkillType, SystemPrompt, ThinkingConfig, ThinkingDisplay,
     ToolChoice, ToolUnionParam,
 };
+use crate::types::{message_param, open_union};
 
 /// Security limits for DoS prevention
 const MAX_MESSAGE_COUNT: usize = 1000;
@@ -18,6 +19,7 @@ const MIN_TASK_BUDGET_TOTAL: u64 = 20_000;
 
 /// Parameters for creating messages.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageCreateParams {
     /// The maximum number of tokens to generate before stopping.
     ///
@@ -88,13 +90,6 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
 
-    /// Amount of randomness injected into the response.
-    ///
-    /// Defaults to `1.0`. Current models (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1)
-    /// reject any other value; leave this unset for them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-
     /// Configuration for Claude's extended thinking.
     ///
     /// When thinking is on, responses include `thinking` content blocks before the final
@@ -110,8 +105,7 @@ pub struct MessageCreateParams {
 
     /// How the model should use the provided tools.
     ///
-    /// The model can use a specific tool, any available tool, decide by itself, or not
-    /// use tools at all.
+    /// The model can decide by itself or not use tools at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
@@ -123,22 +117,6 @@ pub struct MessageCreateParams {
     /// return results back to the model using `tool_result` content blocks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolUnionParam>>,
-
-    /// Only sample from the top K options for each subsequent token.
-    ///
-    /// Current models (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1) reject `top_k` at
-    /// any value; leave this unset for them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
-
-    /// Use nucleus sampling.
-    ///
-    /// In nucleus sampling, we compute the cumulative distribution over all the options
-    /// for each subsequent token in decreasing probability order and cut it off once it
-    /// reaches a particular probability specified by `top_p`. Current models (Opus 5.5,
-    /// Sonnet 5.5, Haiku 5.5, Fable 5.1) only accept values >= 0.99.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
 
     /// Models to fall back to if this request is refused.
     ///
@@ -231,28 +209,8 @@ pub struct MessageCreateParams {
 }
 
 impl MessageCreateParams {
-    /// Helper function to validate a float value is within the 0.0-1.0 range (optimized)
-    #[inline]
-    fn validate_float_range(value: f32, field_name: &str) -> Result<(), crate::Error> {
-        // Fast path for common valid values
-        if (0.0..=1.0).contains(&value) && value.is_finite() {
-            return Ok(());
-        }
-
-        // Handle edge cases
-        if value.is_nan() {
-            return Err(crate::Error::validation(
-                format!("{field_name} cannot be NaN"),
-                Some(field_name.to_string()),
-            ));
-        }
-
-        Err(crate::Error::validation(
-            format!("{field_name} must be between 0.0 and 1.0, got {value}"),
-            Some(field_name.to_string()),
-        ))
-    }
     /// Create a new message creation parameters with streaming disabled.
+    #[must_use]
     pub fn new(max_tokens: u32, messages: Vec<MessageParam>, model: Model) -> Self {
         Self {
             max_tokens,
@@ -263,12 +221,9 @@ impl MessageCreateParams {
             output_config: None,
             stop_sequences: None,
             system: None,
-            temperature: None,
             thinking: None,
             tool_choice: None,
             tools: None,
-            top_k: None,
-            top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
             service_tier: None,
@@ -285,6 +240,7 @@ impl MessageCreateParams {
     }
 
     /// Create new streaming message creation parameters.
+    #[must_use]
     pub fn new_streaming(max_tokens: u32, messages: Vec<MessageParam>, model: Model) -> Self {
         Self {
             max_tokens,
@@ -295,12 +251,9 @@ impl MessageCreateParams {
             output_config: None,
             stop_sequences: None,
             system: None,
-            temperature: None,
             thinking: None,
             tool_choice: None,
             tools: None,
-            top_k: None,
-            top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
             service_tier: None,
@@ -319,12 +272,14 @@ impl MessageCreateParams {
     /// Enable automatic prompt caching.
     ///
     /// Applies the cache breakpoint to the last cacheable block automatically.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Add metadata to the parameters.
+    #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
@@ -351,74 +306,49 @@ impl MessageCreateParams {
     ///         "additionalProperties": false
     ///     }))));
     /// ```
+    #[must_use]
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
         self
     }
 
     /// Add stop sequences to the parameters.
+    #[must_use]
     pub fn with_stop_sequences(mut self, stop_sequences: Vec<String>) -> Self {
         self.stop_sequences = Some(stop_sequences);
         self
     }
 
-    /// Add a system prompt as a string.
-    pub fn with_system_string(mut self, system: String) -> Self {
-        self.system = Some(SystemPrompt::from_string(system));
-        self
-    }
-
-    /// Add a system prompt as text blocks.
-    pub fn with_system_blocks(mut self, blocks: Vec<TextBlock>) -> Self {
-        self.system = Some(SystemPrompt::from_blocks(blocks));
-        self
-    }
-
-    /// Add a system prompt.
+    /// Add a system prompt: a `String`, a `&str` or a `Vec<TextBlock>`.
+    #[must_use]
     pub fn with_system(mut self, system: impl Into<SystemPrompt>) -> Self {
         self.system = Some(system.into());
         self
     }
 
-    /// Add temperature to the parameters.
-    pub fn with_temperature(mut self, temperature: f32) -> Result<Self, crate::Error> {
-        Self::validate_float_range(temperature, "temperature")?;
-        self.temperature = Some(temperature);
-        Ok(self)
-    }
-
     /// Add thinking configuration to the parameters.
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
     /// Add tool choice to the parameters.
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
     /// Add tools to the parameters.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolUnionParam>) -> Self {
         self.tools = Some(tools);
         self
     }
 
-    /// Add top_k to the parameters.
-    pub fn with_top_k(mut self, top_k: u32) -> Self {
-        self.top_k = Some(top_k);
-        self
-    }
-
-    /// Add top_p to the parameters.
-    pub fn with_top_p(mut self, top_p: f32) -> Result<Self, crate::Error> {
-        Self::validate_float_range(top_p, "top_p")?;
-        self.top_p = Some(top_p);
-        Ok(self)
-    }
-
     /// Sets the streaming option.
+    #[must_use]
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = stream;
         self
@@ -428,6 +358,7 @@ impl MessageCreateParams {
     ///
     /// Replaces any previously configured fallbacks. Server-side fallback is in beta and
     /// requires the `fallbacks` beta header.
+    #[must_use]
     pub fn with_fallbacks(
         mut self,
         fallbacks: impl IntoIterator<Item = impl Into<FallbackConfig>>,
@@ -439,12 +370,14 @@ impl MessageCreateParams {
     }
 
     /// Use Anthropic's recommended fallback routing for each refusal category.
+    #[must_use]
     pub fn with_default_fallbacks(mut self) -> Self {
         self.fallbacks = Some(Fallbacks::Default);
         self
     }
 
     /// Redeem the cache-miss credit returned by a prior refusal.
+    #[must_use]
     pub fn with_fallback_credit_token(mut self, token: impl Into<String>) -> Self {
         self.fallback_credit_token = Some(token.into());
         self
@@ -453,8 +386,9 @@ impl MessageCreateParams {
     /// Add a single fallback model for this request.
     ///
     /// Appends to any previously configured fallbacks, preserving order.
+    #[must_use]
     pub fn with_fallback(mut self, fallback: impl Into<FallbackConfig>) -> Self {
-        let config = fallback.into();
+        let config: FallbackConfig = fallback.into();
         match self
             .fallbacks
             .get_or_insert_with(|| Fallbacks::Models(Vec::new()))
@@ -466,48 +400,56 @@ impl MessageCreateParams {
     }
 
     /// Choose the service tier for this request.
+    #[must_use]
     pub fn with_service_tier(mut self, service_tier: ServiceTierChoice) -> Self {
         self.service_tier = Some(service_tier);
         self
     }
 
     /// Set the inference speed (fast mode is not allowed in batches).
+    #[must_use]
     pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
         self.speed = Some(speed);
         self
     }
 
     /// Set the inference geography (`"global"` or `"us"`).
+    #[must_use]
     pub fn with_inference_geo(mut self, inference_geo: impl Into<String>) -> Self {
         self.inference_geo = Some(inference_geo.into());
         self
     }
 
     /// Set the container for code execution and skills.
+    #[must_use]
     pub fn with_container(mut self, container: Container) -> Self {
         self.container = Some(container);
         self
     }
 
     /// Opt in to cache diagnostics, comparing against the previous response.
+    #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: DiagnosticsRequest) -> Self {
         self.diagnostics = Some(diagnostics);
         self
     }
 
     /// Set server-side context management.
+    #[must_use]
     pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
         self.context_management = Some(context_management);
         self
     }
 
     /// Request compaction on demand.
+    #[must_use]
     pub fn with_compaction(mut self, compaction: CompactionRequest) -> Self {
         self.compaction = Some(compaction);
         self
     }
 
     /// Set the remote MCP servers.
+    #[must_use]
     pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
         self.mcp_servers = Some(mcp_servers);
         self
@@ -518,6 +460,7 @@ impl MessageCreateParams {
     /// These are merged with any client-level default betas and the betas
     /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
@@ -526,6 +469,7 @@ impl MessageCreateParams {
     /// Add a single beta feature header for this request.
     ///
     /// Appends to any previously set betas.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -547,16 +491,12 @@ impl MessageCreateParams {
                 self.output_config
                     .as_ref()
                     .is_some_and(|config| config.format.is_some()),
-                matches!(
-                    self.tool_choice,
-                    Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. })
-                ),
             ]
             .into_iter()
             .any(std::convert::identity);
             if requires_output {
                 return Err(crate::Error::validation(
-                    "max_tokens: 0 cannot request streaming, thinking, structured output, or forced tools",
+                    "max_tokens: 0 cannot request streaming, thinking, or structured output",
                     Some("max_tokens".to_string()),
                 ));
             }
@@ -592,28 +532,10 @@ impl MessageCreateParams {
             ));
         }
 
-        // Validate floating point parameters
-        if let Some(temp) = self.temperature {
-            Self::validate_float_range(temp, "temperature")?;
-        }
-        if let Some(top_p) = self.top_p {
-            Self::validate_float_range(top_p, "top_p")?;
-        }
-
         if let Some(tools) = &self.tools {
             for tool in tools {
                 tool.validate()?;
             }
-        }
-
-        // Validate top_k is reasonable
-        if let Some(top_k) = self.top_k
-            && top_k > 1000
-        {
-            return Err(crate::Error::validation(
-                format!("top_k {top_k} exceeds reasonable limit of 1000"),
-                Some("top_k".to_string()),
-            ));
         }
 
         // Validate stop sequences
@@ -693,6 +615,29 @@ impl MessageCreateParams {
                     ));
                 }
             }
+        }
+
+        message_param::check_turns(&self.messages)?;
+        if self.speed == Some(InferenceSpeed::Unknown) {
+            return Err(open_union::unknown_in_request("speed".to_string()));
+        }
+        if let Some(Fallbacks::Models(fallbacks)) = &self.fallbacks
+            && let Some(index) = fallbacks
+                .iter()
+                .position(|fallback| fallback.speed == Some(InferenceSpeed::Unknown))
+        {
+            return Err(open_union::unknown_in_request(format!(
+                "fallbacks[{index}].speed"
+            )));
+        }
+        if let Some(Container::Config { skills, .. }) = &self.container
+            && let Some(index) = skills
+                .iter()
+                .position(|skill| skill.r#type == SkillType::Unknown)
+        {
+            return Err(open_union::unknown_in_request(format!(
+                "container.skills[{index}].type"
+            )));
         }
 
         if self.compaction.is_some() && self.context_management.is_some() {
@@ -777,6 +722,7 @@ impl MessageCreateParams {
     ///
     /// This is a convenience method for creating basic message requests without
     /// needing to specify all parameters explicitly.
+    #[must_use]
     pub fn simple(prompt: impl Into<MessageParam>, model: impl Into<Model>) -> Self {
         Self::new(
             1024, // Reasonable default for max_tokens
@@ -786,6 +732,7 @@ impl MessageCreateParams {
     }
 
     /// Create a simple streaming message request with sensible defaults.
+    #[must_use]
     pub fn simple_streaming(prompt: impl Into<MessageParam>, model: impl Into<Model>) -> Self {
         Self::new_streaming(
             1024, // Reasonable default for max_tokens
@@ -795,12 +742,14 @@ impl MessageCreateParams {
     }
 
     /// Add a single message to the parameters.
+    #[must_use]
     pub fn with_message(mut self, message: impl Into<MessageParam>) -> Self {
         self.messages.push(message.into());
         self
     }
 
     /// Add multiple messages to the parameters.
+    #[must_use]
     pub fn with_messages(
         mut self,
         messages: impl IntoIterator<Item = impl Into<MessageParam>>,
@@ -828,12 +777,9 @@ impl Default for MessageCreateParams {
             output_config: None,
             stop_sequences: None,
             system: None,
-            temperature: None,
             thinking: None,
             tool_choice: None,
             tools: None,
-            top_k: None,
-            top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
             service_tier: None,
@@ -861,16 +807,14 @@ mod tests {
 
     #[test]
     fn message_create_params_non_streaming() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let params = MessageCreateParams::new(
             1000,
             vec![message],
             Model::Known(KnownModel::ClaudeSonnet55),
         )
-        .with_system_string("You are a helpful assistant.".to_string())
-        .with_temperature(0.125)
-        .unwrap();
+        .with_system("You are a helpful assistant.");
 
         let json = to_value(&params).unwrap();
         assert!(!params.stream);
@@ -887,7 +831,6 @@ mod tests {
                 ],
                 "model": "claude-sonnet-5-5",
                 "system": "You are a helpful assistant.",
-                "temperature": 0.125,
                 "stream": false
             })
         );
@@ -895,7 +838,7 @@ mod tests {
 
     #[test]
     fn message_create_params_streaming() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let params = MessageCreateParams::new_streaming(
             1000,
@@ -924,7 +867,7 @@ mod tests {
 
     #[test]
     fn message_create_params_with_stream() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let params = MessageCreateParams::new(
             1000,
@@ -1012,7 +955,7 @@ mod tests {
     fn message_create_params_serializes_tool_result_messages_without_duplicate_type() {
         let message = MessageParam::new_with_blocks(
             vec![ContentBlock::ToolResult(
-                ToolResultBlock::new("toolu_123".to_string()).with_string_content("ok".to_string()),
+                ToolResultBlock::new("toolu_123").with_string_content("ok"),
             )],
             MessageRole::User,
         );
@@ -1238,7 +1181,7 @@ mod tests {
             json!("container_011")
         );
 
-        let by_config = simple_params().with_container(Container::with_skills(vec![
+        let by_config = simple_params().with_container(Container::new_with_skills(vec![
             SkillRef::anthropic("pptx").with_version("latest"),
         ]));
         assert_eq!(
@@ -1343,7 +1286,7 @@ mod tests {
             .with_compaction(CompactionRequest::new())
             .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]));
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
@@ -1354,7 +1297,7 @@ mod tests {
                 .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(total)))
         };
         let err = make(19_999).validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("task_budget"));
         assert!(make(20_000).validate().is_ok());
     }
@@ -1366,11 +1309,47 @@ mod tests {
                 .map(|i| SkillRef::custom(format!("skill_{i}")))
                 .collect::<Vec<_>>()
         };
-        let too_many = simple_params().with_container(Container::with_skills(skills(21)));
+        let too_many = simple_params().with_container(Container::new_with_skills(skills(21)));
         let err = too_many.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("skills"));
-        let ok = simple_params().with_container(Container::with_skills(skills(20)));
+        let ok = simple_params().with_container(Container::new_with_skills(skills(20)));
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_values_read_from_replies() {
+        let param_of = |params: MessageCreateParams| match params.validate() {
+            Err(error) => match error.kind() {
+                crate::ErrorKind::Validation { param, .. } => param.clone(),
+                _ => panic!("expected a validation error, got {error:?}"),
+            },
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+
+        let mut params = simple_params();
+        params.messages[0].role = MessageRole::Unknown;
+        assert_eq!(param_of(params).as_deref(), Some("messages[0].role"));
+
+        let params = simple_params().with_speed(InferenceSpeed::Unknown);
+        assert_eq!(param_of(params).as_deref(), Some("speed"));
+
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
+            .with_fallback(KnownModel::ClaudeSonnet55)
+            .with_fallback(
+                FallbackConfig::new(KnownModel::ClaudeHaiku55).with_speed(InferenceSpeed::Unknown),
+            );
+        assert_eq!(param_of(params).as_deref(), Some("fallbacks[1].speed"));
+
+        let mut skill = SkillRef::anthropic("xlsx");
+        skill.r#type = SkillType::Unknown;
+        let params = simple_params().with_container(Container::new_with_skills(vec![skill]));
+        assert_eq!(
+            param_of(params).as_deref(),
+            Some("container.skills[0].type")
+        );
+
+        // Serializing a reply type for storage still works.
+        assert_eq!(to_value(MessageRole::Unknown).unwrap(), json!("unknown"));
     }
 }

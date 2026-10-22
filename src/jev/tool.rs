@@ -4,9 +4,9 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Answer, JevClient, JevResponse, Questions};
-use crate::error::{Error, Result};
-use crate::tool::ClientTool;
+use super::{Answer, JevClient, JevErrorCode, JevResponse, NamedAnswer, Questions};
+use crate::client_tool::ClientTool;
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 const TOOL_NAME: &str = "jev";
@@ -14,9 +14,10 @@ const TOOL_NAME: &str = "jev";
 /// Jev exposed to Claude as a client-side `jev` tool.
 ///
 /// One call sends one state with any number of questions and costs one Jev request. Problems
-/// the model or a retry can fix (bad input, a failed check, 400, 413, 422, 429, 5xx, timeouts,
-/// connection failures, an edge-proxy block) come back as an `is_error` result. A rejected key
-/// (401), a 403 with a JSON body and other configuration problems are returned as `Err`.
+/// the model or a retry can fix (bad input, a failed check, 400, 408, 409, 413, 422, 429, 5xx,
+/// timeouts, connection failures, an edge-proxy block) come back as an `is_error` result. A
+/// rejected key (401), a 403 with a JSON body and other configuration problems are returned as
+/// `Err`.
 #[derive(Debug, Clone)]
 pub struct JevTool {
     client: JevClient,
@@ -24,16 +25,17 @@ pub struct JevTool {
 
 impl JevTool {
     /// Wrap a client. The client's model, timeout and retries apply to every call.
+    #[must_use]
     pub fn new(client: JevClient) -> Self {
         Self { client }
     }
 
     async fn run(&self, tool_use: &ToolUseBlock) -> Result<ToolResultBlock> {
         let id = tool_use.id.clone();
-        let input = match serde_json::from_value::<ToolInput>(tool_use.input.clone()) {
+        let input = match ToolInput::deserialize(&tool_use.input) {
             Ok(input) => input,
             Err(error) => {
-                return Ok(error_result(
+                return Ok(ToolResultBlock::error(
                     id,
                     format!(
                         "Invalid jev input: {error}. Send an object with \"state\" (a string, \
@@ -42,15 +44,15 @@ impl JevTool {
                 ));
             }
         };
-        let questions = questions(&input.questions);
+        let questions = Questions::from_tool(&input.questions);
         match self.client.ask(input.state, &questions).await {
             Ok(response) => Ok(ToolResultBlock::new(id)
                 .with_text_content(TextBlock::new(render(&response, &input.questions)))),
             Err(error) if is_fatal(&error) => Err(error),
-            Err(Error::Validation { message, .. }) => {
-                Ok(error_result(id, format!("Invalid jev call: {message}")))
-            }
-            Err(error) => Ok(error_result(id, format!("Jev failed: {error}"))),
+            Err(error) if matches!(error.kind(), ErrorKind::Validation { .. }) => Ok(
+                ToolResultBlock::error(id, format!("Invalid jev call: {error}")),
+            ),
+            Err(error) => Ok(ToolResultBlock::error(id, format!("Jev failed: {error}"))),
         }
     }
 }
@@ -192,59 +194,64 @@ pub(crate) struct ToolOption {
     description: Option<String>,
 }
 
-// Only these failures are the developer's to fix; everything else goes back to the model.
-// Timeouts and connection failures are checked first: a body-phase timeout carries the status
-// its headers arrived with, often 200.
+// Only these failures are the developer's to fix; everything else goes back to the model. A
+// retryable error is never fatal. Jev answers in the `Api` kind only for non-2xx statuses; every
+// transport or body failure has its own kind and is not fatal.
 pub(crate) fn is_fatal(error: &Error) -> bool {
-    if matches!(error, Error::Timeout { .. } | Error::Connection { .. }) {
+    if error.is_retryable() {
         return false;
     }
-    match error.status_code() {
-        // A 2xx here means the body read failed after the headers arrived.
-        Some(200..=299 | 400 | 408 | 413 | 422 | 429 | 500..=599) => false,
-        Some(403) => error.metadata().and_then(|m| m.error_type.as_deref()) != Some("edge_blocked"),
-        Some(_) => true,
-        None => false,
+    match error.kind() {
+        ErrorKind::Api {
+            status: Some(403),
+            error_code,
+            ..
+        } => error_code != &Some(ErrorCode::Jev(JevErrorCode::EdgeBlocked)),
+        ErrorKind::Api {
+            status: Some(400 | 413 | 422),
+            ..
+        } => false,
+        ErrorKind::Api {
+            status: Some(_), ..
+        } => true,
+        _ => false,
     }
 }
 
-fn error_result(id: String, message: String) -> ToolResultBlock {
-    ToolResultBlock::new(id)
-        .with_string_content(message)
-        .with_error(true)
-}
-
-/// The model's questions as [`Questions`], in order.
-pub(crate) fn questions(items: &[ToolQuestion]) -> Questions {
-    let mut questions = Questions::new();
-    for question in items {
-        questions = match question {
-            ToolQuestion::Noul { name, instructions } => {
-                questions.noul(name.as_str(), instructions.as_str())
-            }
-            ToolQuestion::Choice {
-                name,
-                instructions,
-                options,
-            } => questions.choice(
-                name.as_str(),
-                instructions.as_str(),
-                options
-                    .iter()
-                    .map(|o| (o.label.as_str(), o.description.as_deref())),
-            ),
-            ToolQuestion::Score {
-                name,
-                instructions,
-                levels,
-            } => questions.score(
-                name.as_str(),
-                instructions.as_str(),
-                levels.iter().map(String::as_str),
-            ),
-        };
+impl Questions {
+    /// The model's questions as [`Questions`], in order.
+    #[must_use]
+    pub(crate) fn from_tool(items: &[ToolQuestion]) -> Self {
+        let mut questions = Self::new();
+        for question in items {
+            questions = match question {
+                ToolQuestion::Noul { name, instructions } => {
+                    questions.noul(name.as_str(), instructions.as_str())
+                }
+                ToolQuestion::Choice {
+                    name,
+                    instructions,
+                    options,
+                } => questions.choice(
+                    name.as_str(),
+                    instructions.as_str(),
+                    options
+                        .iter()
+                        .map(|o| (o.label.as_str(), o.description.as_deref())),
+                ),
+                ToolQuestion::Score {
+                    name,
+                    instructions,
+                    levels,
+                } => questions.score(
+                    name.as_str(),
+                    instructions.as_str(),
+                    levels.iter().map(String::as_str),
+                ),
+            };
+        }
+        questions
     }
-    questions
 }
 
 fn render(response: &JevResponse, questions: &[ToolQuestion]) -> String {
@@ -268,14 +275,14 @@ pub(crate) fn answers(
         })
     };
     let mut answers = serde_json::Map::new();
-    for (name, answer) in &response.answers {
+    for NamedAnswer { name, answer } in &response.answers {
         let value = match answer {
             Answer::Noul(p) => json!({"type": "noul", "probability_yes": p}),
             Answer::Choice(choice) => {
                 let probabilities: serde_json::Map<String, Value> = choice
                     .probabilities
                     .iter()
-                    .map(|(label, p)| (label.clone(), json!(p)))
+                    .map(|option| (option.label.clone(), json!(option.probability)))
                     .collect();
                 json!({
                     "type": "choice",
@@ -296,7 +303,7 @@ pub(crate) fn answers(
                     "probabilities": score.probabilities
                 })
             }
-            Answer::Unknown { raw, .. } => raw.clone(),
+            Answer::Unknown(raw) => raw.clone(),
             Answer::Malformed { kind, .. } => {
                 json!({"type": kind, "error": "Jev's answer could not be read"})
             }

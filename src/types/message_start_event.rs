@@ -4,6 +4,7 @@ use crate::types::Message;
 
 /// An event that represents the start of a message in a streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageStartEvent {
     /// The message that is starting.
     pub message: Message,
@@ -11,6 +12,7 @@ pub struct MessageStartEvent {
 
 impl MessageStartEvent {
     /// Create a new `MessageStartEvent` with the given message.
+    #[must_use]
     pub fn new(message: Message) -> Self {
         Self { message }
     }
@@ -19,17 +21,17 @@ impl MessageStartEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ContentBlock, MessageRole, Model, TextBlock, Usage};
+    use crate::types::{ContentBlock, KnownModel, MessageRole, Model, TextBlock, Usage};
     use serde_json::{json, to_value};
 
     #[test]
     fn message_start_event_serialization() {
-        let text_block = TextBlock::new("Hello, I'm Claude.".to_string());
+        let text_block = TextBlock::new("Hello, I'm Claude.");
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(crate::types::KnownModel::ClaudeSonnet55);
+        let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
-        let message = Message::new("msg_012345".to_string(), content, model, usage);
+        let message = Message::new("msg_012345", content, model, usage);
 
         let event = MessageStartEvent::new(message);
 

@@ -1,12 +1,20 @@
+#![cfg(test)]
+
 use std::collections::HashMap;
+use std::error::Error as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 
+use super::client::DEFAULT_BASE_URL;
 use super::*;
 use crate::ClientTool;
-use crate::test_support::{Canned, Recorded, serve};
+use crate::error::{Error, ErrorCode, ErrorKind, Service};
+use crate::test_support::{Canned, Recorded, serve, uses_proxies, warnings_on};
 use crate::types::{
     Content, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
 };
@@ -23,14 +31,22 @@ enum Team {
 }
 
 impl Choices for Team {
-    const OPTIONS: &'static [(Self, &'static str, Option<&'static str>)] = &[
-        (
-            Team::Billing,
-            "billing",
-            Some("Charges, payments, and refunds"),
-        ),
-        (Team::Technical, "technical", Some("Software faults")),
-        (Team::Other, "other", Some("Anything else")),
+    const OPTIONS: &'static [ChoiceOption<Self>] = &[
+        ChoiceOption {
+            value: Team::Billing,
+            label: "billing",
+            description: Some("Charges, payments, and refunds"),
+        },
+        ChoiceOption {
+            value: Team::Technical,
+            label: "technical",
+            description: Some("Software faults"),
+        },
+        ChoiceOption {
+            value: Team::Other,
+            label: "other",
+            description: Some("Anything else"),
+        },
     ];
 }
 
@@ -42,15 +58,24 @@ enum Urgency {
 }
 
 impl Levels for Urgency {
-    const LEVELS: &'static [(Self, &'static str)] = &[
-        (Urgency::NoDeadline, "No deadline"),
-        (Urgency::Week, "Within a week"),
-        (Urgency::Today, "Today"),
+    const LEVELS: &'static [Level<Self>] = &[
+        Level {
+            value: Urgency::NoDeadline,
+            text: "No deadline",
+        },
+        Level {
+            value: Urgency::Week,
+            text: "Within a week",
+        },
+        Level {
+            value: Urgency::Today,
+            text: "Today",
+        },
     ];
 }
 
 fn client(base_url: &str) -> JevClient {
-    JevClient::new(KEY, "jev-1.13.0")
+    JevClient::try_new(KEY, "jev-1.13.0")
         .unwrap()
         .with_base_url(base_url)
         .unwrap()
@@ -123,9 +148,22 @@ fn deep_state(depth: usize) -> Value {
 }
 
 fn validation_param(error: &Error) -> Option<&str> {
-    match error {
-        Error::Validation { param, .. } => param.as_deref(),
-        other => panic!("expected a validation error, got {other:?}"),
+    match error.kind() {
+        ErrorKind::Validation { param, .. } => param.as_deref(),
+        _ => panic!("expected a validation error, got {error:?}"),
+    }
+}
+
+fn error_code(error: &Error) -> Option<JevErrorCode> {
+    match error.kind() {
+        ErrorKind::Api {
+            error_code: None, ..
+        } => None,
+        ErrorKind::Api {
+            error_code: Some(ErrorCode::Jev(code)),
+            ..
+        } => Some(*code),
+        _ => panic!("expected a Jev API error, got {error:?}"),
     }
 }
 
@@ -162,7 +200,11 @@ async fn golden_request_bytes_and_headers() {
     assert_eq!(header(request, "x-typesafe-retry-count"), None);
 
     assert_eq!(response.model, "jev-1.13.0");
-    let names: Vec<&str> = response.answers.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = response
+        .answers
+        .iter()
+        .map(|answer| answer.name.as_str())
+        .collect();
     assert_eq!(names, ["route", "urgency", "refund_requested"]);
     assert_eq!(
         response.usage,
@@ -315,24 +357,19 @@ async fn validation_failures_send_nothing() {
             "nested more than 64 levels deep",
             "state",
         ),
-        (
-            "body over 32 MiB",
-            Value::String("x".repeat(32 * 1024 * 1024)),
-            one(),
-            "over the 32 MiB limit",
-            "state",
-        ),
     ];
     for (case, state, questions, expected, param) in cases {
-        match jev.ask(state, &questions).await.unwrap_err() {
-            Error::Validation {
-                message,
+        let error = jev.ask(state, &questions).await.unwrap_err();
+        match error.kind() {
+            ErrorKind::Validation {
                 param: Some(actual),
+                ..
             } => {
+                let message = error.message();
                 assert!(message.contains(expected), "{case}: {message}");
                 assert_eq!(actual, param, "{case}");
             }
-            other => panic!("{case}: expected a validation error with a param, got {other}"),
+            _ => panic!("{case}: expected a validation error with a param, got {error}"),
         }
     }
     assert!(recorded.lock().unwrap().is_empty());
@@ -389,12 +426,12 @@ fn rounded_probabilities_are_accepted() {
     let route = response.choice("route").unwrap();
     assert_eq!(route.choice, "technical");
     assert_eq!(
-        route.probabilities,
-        vec![
-            ("billing".to_string(), 0.4),
-            ("technical".to_string(), 0.39),
-            ("other".to_string(), 0.2)
-        ]
+        route
+            .probabilities
+            .iter()
+            .map(|label| (label.label.as_str(), label.probability))
+            .collect::<Vec<_>>(),
+        vec![("billing", 0.4), ("technical", 0.39), ("other", 0.2)]
     );
     assert_eq!(
         response.choose::<Team>("route", 0.1).unwrap(),
@@ -405,6 +442,46 @@ fn rounded_probabilities_are_accepted() {
     assert_eq!(progress.mode(), Some(2));
     assert_eq!(progress.legend["0"], json!({"level": "none"}));
     assert_eq!(response.usage, JevUsage::default());
+}
+
+#[test]
+fn detail_error_type_maps_to_a_jev_code_and_warns_once_when_unknown() {
+    let (codes, warnings) = crate::test_support::unknown_warnings(|| {
+        [
+            JevErrorCode::from_detail("max_tokens_exceeded"),
+            JevErrorCode::from_detail("quota_melted"),
+            JevErrorCode::from_detail("quota_melted"),
+        ]
+    });
+    assert_eq!(
+        codes,
+        [
+            JevErrorCode::MaxTokensExceeded,
+            JevErrorCode::Unknown,
+            JevErrorCode::Unknown
+        ]
+    );
+    assert_eq!(warnings, ["rust_type=JevErrorCode tag=quota_melted"]);
+}
+
+#[test]
+fn unknown_answer_type_is_logged_once_without_its_payload() {
+    let raw = json!({"type": "hologram_answer", "secret": "user text"});
+    let (answers, warnings) = crate::test_support::unknown_warnings(|| {
+        [
+            super::answer::parse_answer(raw.clone()),
+            super::answer::parse_answer(raw.clone()),
+        ]
+    });
+    assert_eq!(
+        answers,
+        [Answer::Unknown(raw.clone()), Answer::Unknown(raw)]
+    );
+    assert_eq!(warnings, ["rust_type=Answer tag=hologram_answer"]);
+    let debug = format!("{:?}", answers[0]);
+    assert!(debug.contains("hologram_answer"), "{debug}");
+    assert!(debug.contains("raw_bytes"), "{debug}");
+    assert!(!debug.contains("user text"), "{debug}");
 }
 
 #[tokio::test]
@@ -428,11 +505,8 @@ async fn unknown_answer_type_is_kept_and_reported_at_extraction() {
         .unwrap();
     assert_eq!(response.noul("refund").unwrap(), 0.97);
     assert_eq!(
-        response.answers[1].1,
-        Answer::Unknown {
-            kind: "ranking".to_string(),
-            raw: json!({"type": "ranking", "ranking": ["a", "b"]})
-        }
+        response.answers[1].answer,
+        Answer::Unknown(json!({"type": "ranking", "ranking": ["a", "b"]}))
     );
     let error = response.noul("order").unwrap_err();
     assert!(error.to_string().contains("\"order\""), "{error}");
@@ -458,9 +532,9 @@ async fn rate_limit_is_retried_after_retry_after() {
         .ask(json!({"message": MESSAGE}), &triage_questions())
         .await
         .unwrap();
-    // Backoff waits at least 500 ms before the first retry; Retry-After: 0 does not.
+    // The wait is the longer of the backoff (at least 500 ms) and Retry-After: 0.
     assert!(
-        started.elapsed() < Duration::from_millis(400),
+        started.elapsed() >= Duration::from_millis(500),
         "{:?}",
         started.elapsed()
     );
@@ -484,7 +558,7 @@ async fn long_retry_after_gives_up_at_once() {
         .await
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(error.is_rate_limit(), "{error}");
+    assert_eq!(error.status(), Some(429), "{error}");
     assert_eq!(error.retry_after(), Some(Duration::from_secs(61)));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
@@ -503,7 +577,7 @@ async fn retry_after_past_the_budget_gives_up_at_once() {
         .await
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert_eq!(error.status_code(), Some(503));
+    assert_eq!(error.status(), Some(503));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
 
@@ -525,6 +599,66 @@ async fn server_errors_are_retried() {
 }
 
 #[tokio::test]
+async fn a_post_closed_before_any_reply_is_resent() {
+    let (url, recorded) = serve(vec![
+        Canned::json(200, "").closing_unanswered(),
+        ok(triage_response()),
+    ])
+    .await;
+    let response = client(&url)
+        .ask(json!({"message": MESSAGE}), &triage_questions())
+        .await
+        .unwrap();
+    assert_eq!(response.attempts, 2);
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn conflict_is_retried() {
+    let (url, recorded) = serve(vec![
+        Canned::json(409, r#"{"detail":"busy"}"#),
+        ok(triage_response()),
+    ])
+    .await;
+    let response = client(&url)
+        .ask(json!({"message": MESSAGE}), &triage_questions())
+        .await
+        .unwrap();
+    assert_eq!(response.attempts, 2);
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn error_status_with_a_cut_body_keeps_its_status_and_is_retried() {
+    let cut = || {
+        Canned::json(503, r#"{"detail":"#)
+            .with_header("x-typesafe-request-id", "req_cut")
+            .with_header("Retry-After", "1")
+            .with_cut_body()
+    };
+    let (url, _) = serve(vec![cut()]).await;
+    let error = client(&url)
+        .with_max_retries(0)
+        .ask("s", &Questions::new().noul("q", "Is it?"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), Some(503), "{error:?}");
+    assert!(error.is_retryable());
+    assert_eq!(error.request_id(), Some("req_cut"));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
+    assert_eq!(error.message(), "HTTP 503 with no error message");
+    assert!(error.source().is_some());
+
+    let (url, recorded) = serve(vec![cut(), ok(triage_response())]).await;
+    let response = client(&url)
+        .ask(json!({"message": MESSAGE}), &triage_questions())
+        .await
+        .unwrap();
+    assert_eq!(response.attempts, 2);
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn stalled_body_times_out_per_attempt() {
     let (url, recorded) = serve(vec![
         ok(triage_response()).with_stall(Duration::from_secs(3)),
@@ -537,7 +671,7 @@ async fn stalled_body_times_out_per_attempt() {
         .ask(json!({"message": MESSAGE}), &triage_questions())
         .await
         .unwrap_err();
-    assert!(error.is_timeout(), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Timeout), "{error}");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
@@ -558,12 +692,12 @@ async fn unprocessable_detail_never_includes_input() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.status_code(), Some(422));
+    assert_eq!(error.status(), Some(422));
     let text = error.to_string();
     assert!(
         text.contains(
-            "Jev returned 422: body.questions.route.criteria: Field required; \
-             body.questions.0: Too short"
+            "Jev API error: body.questions.route.criteria: Field required; \
+             body.questions.0: Too short (HTTP 422"
         ),
         "{text}"
     );
@@ -583,14 +717,13 @@ async fn unauthorized_json_is_an_authentication_error() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(error.is_authentication(), "{error}");
-    let metadata = error.metadata().unwrap();
-    assert_eq!(metadata.error_type.as_deref(), Some("authentication_error"));
+    assert_eq!(error.status(), Some(401), "{error}");
+    // TypeSafe documents only `max_tokens_exceeded`, so this code is unknown.
+    assert_eq!(error_code(&error), Some(JevErrorCode::Unknown));
     assert_eq!(error.request_id(), Some("req_401"));
-    assert!(
-        error
-            .to_string()
-            .contains("Jev returned 401: Invalid API key")
+    assert_eq!(
+        error.to_string(),
+        "Jev API error: Invalid API key (HTTP 401, request req_401)"
     );
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
@@ -608,11 +741,8 @@ async fn forbidden_html_is_an_edge_block() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(error.is_permission(), "{error}");
-    assert_eq!(
-        error.metadata().unwrap().error_type.as_deref(),
-        Some("edge_blocked")
-    );
+    assert_eq!(error.status(), Some(403), "{error}");
+    assert_eq!(error_code(&error), Some(JevErrorCode::EdgeBlocked));
     assert_eq!(error.request_id(), Some("8f2a-IAD"));
     let text = error.to_string();
     assert!(text.contains("cf-ray 8f2a-IAD"), "{text}");
@@ -642,30 +772,26 @@ async fn bad_request_details_are_mapped() {
     let questions = Questions::new().noul("q", "Is it?");
 
     let error = jev.ask("s", &questions).await.unwrap_err();
-    assert!(error.is_bad_request(), "{error}");
-    assert!(
-        error
-            .to_string()
-            .contains("Jev returned 400: input too long: Prompt exceeds 8192 tokens"),
-        "{error}"
+    assert_eq!(error.status(), Some(400), "{error}");
+    assert_eq!(error_code(&error), Some(JevErrorCode::MaxTokensExceeded));
+    assert_eq!(
+        error.to_string(),
+        "Jev API error: input too long: Prompt exceeds 8192 tokens \
+         (HTTP 400 max_tokens_exceeded)"
     );
 
     let error = jev.ask("s", &questions).await.unwrap_err();
-    assert_eq!(
-        error.metadata().unwrap().error_type.as_deref(),
-        Some("api_usage_error")
-    );
+    assert_eq!(error_code(&error), Some(JevErrorCode::Unknown));
     assert!(error.to_string().contains("Unknown model jev-9"), "{error}");
 
-    match jev.ask("s", &questions).await.unwrap_err() {
-        Error::BadRequest { message, .. } => assert_eq!(message.chars().count(), 200),
-        other => panic!("expected a bad request, got {other:?}"),
-    }
+    let error = jev.ask("s", &questions).await.unwrap_err();
+    assert_eq!(error.status(), Some(400), "{error:?}");
+    assert_eq!(error.message(), "x".repeat(200));
 
-    match jev.ask("s", &questions).await.unwrap_err() {
-        Error::BadRequest { message, .. } => assert_eq!(message, "Jev returned 400"),
-        other => panic!("expected a bad request, got {other:?}"),
-    }
+    let error = jev.ask("s", &questions).await.unwrap_err();
+    assert_eq!(error.status(), Some(400), "{error:?}");
+    assert_eq!(error.message(), "HTTP 400 with no error message");
+    assert_eq!(error_code(&error), None);
 }
 
 #[tokio::test]
@@ -709,11 +835,13 @@ async fn unparseable_success_reports_byte_count() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::Serialization { .. }), "{error:?}");
+    assert!(matches!(error.kind(), ErrorKind::Decode), "{error:?}");
     assert_eq!(
         error.to_string(),
         format!(
-            "Serialization: Failed to parse Jev response ({} bytes, request id req_9)",
+            "Failed to parse Jev response ({} bytes): unexpected end of input at line 1 \
+             column {} (request req_9)",
+            body.len(),
             body.len()
         )
     );
@@ -920,24 +1048,24 @@ fn env_config_requires_key_and_model() {
         ("TYPESAFE_BASE_URL", "http://api.typesafe.ai"),
     ]))
     .unwrap_err();
-    assert_eq!(validation_param(&error), Some("base_url"));
+    assert_eq!(validation_param(&error), Some("TYPESAFE_BASE_URL"));
 }
 
 #[test]
 fn constructor_checks_key_and_model() {
     for key in ["", "   ", "ts key", "ts-kéy", "ts-key\u{7f}"] {
-        let error = JevClient::new(key, "jev-1.13.0").unwrap_err();
+        let error = JevClient::try_new(key, "jev-1.13.0").unwrap_err();
         assert_eq!(validation_param(&error), Some("api_key"), "{key:?}");
     }
-    let error = JevClient::new(KEY, " ").unwrap_err();
+    let error = JevClient::try_new(KEY, " ").unwrap_err();
     assert_eq!(validation_param(&error), Some("model"));
-    let jev = JevClient::new(format!("  {KEY}\n"), "jev-1.13.0").unwrap();
+    let jev = JevClient::try_new(&format!("  {KEY}\n"), "jev-1.13.0").unwrap();
     assert_eq!(jev.model(), "jev-1.13.0");
 }
 
 #[test]
 fn base_url_needs_https_or_loopback_http() {
-    let jev = || JevClient::new(KEY, "jev-1.13.0").unwrap();
+    let jev = || JevClient::try_new(KEY, "jev-1.13.0").unwrap();
     for url in [
         "https://api.typesafe.ai/",
         "https://staging.example.com/jev",
@@ -966,6 +1094,21 @@ fn base_url_needs_https_or_loopback_http() {
         let error = jev().with_base_url(url).unwrap_err();
         assert_eq!(validation_param(&error), Some("base_url"), "{url}");
     }
+}
+
+#[test]
+fn loopback_base_url_skips_proxies() {
+    let jev = JevClient::try_new(KEY, "jev-1.13.0").unwrap();
+    assert!(uses_proxies(&jev.http));
+    let jev = jev.with_base_url("http://127.0.0.1:1").unwrap();
+    assert!(!uses_proxies(&jev.http));
+    let jev = JevClient::from_env_with(env(&[
+        ("TYPESAFE_API_KEY", KEY),
+        ("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0"),
+        ("TYPESAFE_BASE_URL", "http://127.0.0.1:1"),
+    ]))
+    .unwrap();
+    assert!(!uses_proxies(&jev.http));
 }
 
 fn tool_use(input: Value) -> ToolUseBlock {
@@ -1100,6 +1243,21 @@ async fn tool_reports_fixable_problems_as_error_results() {
 }
 
 #[tokio::test]
+async fn tool_reports_a_conflict_on_every_attempt_as_an_error_result() {
+    let conflict = || Canned::json(409, r#"{"detail":"busy"}"#);
+    let (url, recorded) = serve(vec![conflict(), conflict()]).await;
+    let tool = JevTool::new(client(&url).with_max_retries(1));
+    let result = tool.call(&tool_use(tool_input())).await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("409"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn tool_returns_err_for_rejected_keys() {
     let (url, _) = serve(vec![
         Canned::json(
@@ -1116,9 +1274,9 @@ async fn tool_returns_err_for_rejected_keys() {
     let input =
         json!({"state": "s", "questions": [{"name": "q", "type": "noul", "instructions": "?"}]});
     let error = tool.call(&tool_use(input.clone())).await.unwrap_err();
-    assert!(error.is_authentication(), "{error}");
+    assert_eq!(error.status(), Some(401), "{error}");
     let error = tool.call(&tool_use(input)).await.unwrap_err();
-    assert!(error.is_permission(), "{error}");
+    assert_eq!(error.status(), Some(403), "{error}");
 }
 
 #[tokio::test]
@@ -1134,7 +1292,7 @@ async fn attempt_timeout_is_capped_by_the_retry_budget() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(error.is_timeout(), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Timeout), "{error}");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
@@ -1164,7 +1322,7 @@ async fn blank_and_garbage_retry_after_fall_back_to_backoff() {
 
 #[tokio::test]
 async fn connection_refused_is_retried() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
     let started = Instant::now();
@@ -1173,7 +1331,7 @@ async fn connection_refused_is_retried() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(error.is_connection(), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Connection), "{error}");
     // One backoff of at least 500 ms means a second attempt was made.
     assert!(started.elapsed() >= Duration::from_millis(500));
 }
@@ -1207,7 +1365,7 @@ async fn body_timeout_keeps_the_request_id() {
         .ask("s", &Questions::new().noul("q", "Is it?"))
         .await
         .unwrap_err();
-    assert!(error.is_timeout(), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Timeout), "{error}");
     assert_eq!(error.request_id(), Some("req_stall"));
 
     // A fresh server: the first one is still stalling on the first connection.
@@ -1268,8 +1426,11 @@ fn malformed_known_answer_is_reported_per_question() {
         assert!(!error.to_string().contains(SECRET), "{error}");
     }
     assert!(matches!(
-        &response.answers[1].1,
-        Answer::Malformed { kind, .. } if kind == "noul"
+        &response.answers[1].answer,
+        Answer::Malformed {
+            kind: AnswerKind::Noul,
+            ..
+        }
     ));
     let error = response.noul("other").unwrap_err();
     assert!(error.to_string().contains("does not know"), "{error}");
@@ -1348,4 +1509,215 @@ fn tool_definition_pins_option_objects_and_state_types() {
     assert_eq!(option["type"], json!("object"));
     assert_eq!(option["additionalProperties"], json!(false));
     assert_eq!(option["required"], json!(["label"]));
+}
+
+fn noul_input() -> Value {
+    json!({"state": "s", "questions": [{"name": "q", "type": "noul", "instructions": "?"}]})
+}
+
+#[tokio::test]
+async fn body_over_the_cap_is_request_too_large() {
+    let (url, recorded) = serve(vec![]).await;
+    let limit = 32 * 1024 * 1024;
+    let error = client(&url)
+        .ask(
+            Value::String("x".repeat(limit)),
+            &Questions::new().noul("q", "Is it?"),
+        )
+        .await
+        .unwrap_err();
+    match error.kind() {
+        ErrorKind::RequestTooLarge {
+            size,
+            limit: actual,
+            ..
+        } => {
+            assert!(*size > limit, "{size}");
+            assert_eq!(*actual, limit);
+        }
+        other => panic!("expected RequestTooLarge, got {other:?}"),
+    }
+    assert!(!error.is_retryable());
+    assert!(
+        error.to_string().contains("over the 32 MiB limit"),
+        "{error}"
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failed_request_serialization_keeps_the_serde_error() {
+    struct Unserializable;
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(SECRET))
+        }
+    }
+    let error = super::client::serialize_body(&Unserializable).unwrap_err();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error:?}"
+    );
+    // The cause is only in `source()`, never copied into the message.
+    assert_eq!(error.to_string(), "Failed to serialize the Jev request");
+    let source = error.source().expect("the serde error is the source");
+    assert!(source.to_string().contains(SECRET), "{source}");
+}
+
+#[test]
+fn fatal_split_by_kind_and_status() {
+    let api = |status: u16, code: Option<JevErrorCode>| {
+        Error::http_status(
+            Service::Jev,
+            status,
+            Some("m".to_string()),
+            None,
+            code.map(ErrorCode::Jev),
+            None,
+            None,
+        )
+    };
+    for status in [400, 408, 409, 413, 422, 429, 500, 502, 503, 529, 599] {
+        assert!(!super::tool::is_fatal(&api(status, None)), "{status}");
+    }
+    assert!(!super::tool::is_fatal(&api(
+        403,
+        Some(JevErrorCode::EdgeBlocked)
+    )));
+    for status in [401, 402, 403, 404, 405] {
+        assert!(super::tool::is_fatal(&api(status, None)), "{status}");
+    }
+    assert!(super::tool::is_fatal(&api(
+        403,
+        Some(JevErrorCode::Unknown)
+    )));
+    let others = [
+        Error::api(Service::Jev, None, None, "in stream", None),
+        Error::new(ErrorKind::Timeout, "t"),
+        Error::new(ErrorKind::Connection, "c"),
+        Error::new(ErrorKind::Interrupted, "i").with_request_id(Some("req".to_string())),
+        Error::new(ErrorKind::Decode, "d"),
+        Error::new(
+            ErrorKind::RequestTooLarge { size: 2, limit: 1 },
+            "too large",
+        ),
+        Error::validation("v", None),
+    ];
+    for error in others {
+        assert!(!super::tool::is_fatal(&error), "{error:?}");
+    }
+}
+
+// Answers with headers and a short body, then closes, `connections` times at most, counting
+// the connections it saw.
+async fn serve_truncated(request_id: &str) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = seen.clone();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-typesafe-request-id: {request_id}\r\n\
+         Content-Length: 1000\r\nConnection: close\r\n\r\n{{\"model\":"
+    );
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            crate::test_support::read_request(&mut socket).await;
+            tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes())
+                .await
+                .unwrap();
+            // Dropping the socket closes it with 990 bytes missing.
+        }
+    });
+    (url, seen)
+}
+
+#[tokio::test]
+async fn body_read_failure_is_interrupted_and_not_resent() {
+    let (url, seen) = serve_truncated("req_cut").await;
+    let error = client(&url)
+        .ask("s", &Questions::new().noul("q", "Is it?"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error.kind(), ErrorKind::Interrupted), "{error:?}");
+    assert_eq!(error.request_id(), Some("req_cut"));
+    assert!(error.is_retryable());
+    assert!(error.source().is_some());
+    // A POST may already have been done and billed, so it is never resent automatically.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    // For the tool a cut-off body is a problem the model may retry, not a developer error.
+    let (url, _) = serve_truncated("req_cut").await;
+    let result = tool(&url)
+        .call(&tool_use(noul_input()))
+        .await
+        .expect("an interrupted call is not fatal");
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("req_cut"),
+        "{}",
+        result_text(&result)
+    );
+}
+
+#[test]
+fn unparseable_success_keeps_category_line_and_column() {
+    let body = format!("{{\n  \"model\": \"{SECRET}\",\n  \"answers\": 5}}");
+    let error = JevResponse::parse(
+        Bytes::new(),
+        Bytes::from(body.clone()),
+        Some("req_7".into()),
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind(), ErrorKind::Decode), "{error:?}");
+    assert_eq!(error.request_id(), Some("req_7"));
+    let text = error.to_string();
+    assert!(
+        text.contains("type or value mismatch at line 3 column"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("({} bytes)", body.len()))
+            || text.contains(&format!("{} bytes", body.len())),
+        "{text}"
+    );
+    assert!(!text.contains(SECRET), "{text}");
+    assert!(!format!("{error:?}").contains(SECRET), "{error:?}");
+    assert!(error.source().is_none());
+}
+
+#[test]
+fn malformed_answer_logs_its_shape_not_its_values() {
+    let (response, warnings) = warnings_on("topcoat_si::jev", || {
+        parsed(json!({
+            "model": "jev-1.13.0",
+            "answers": {"bad": {"type": "noul", "noul": SECRET, "extra": 1}}
+        }))
+    });
+    assert!(matches!(
+        response.answers[0].answer,
+        Answer::Malformed { .. }
+    ));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let line = &warnings[0];
+    assert!(line.contains("kind=noul"), "{line}");
+    assert!(line.contains("raw_bytes="), "{line}");
+    assert!(
+        line.contains("object with keys type, noul, extra"),
+        "{line}"
+    );
+    assert!(!line.contains(SECRET), "{line}");
+
+    // A hostile object cannot flood the log.
+    let wide: serde_json::Map<String, Value> = (0..100)
+        .map(|i| (format!("{i}{}", "k".repeat(100)), json!(1)))
+        .chain([("type".to_string(), json!("noul"))])
+        .collect();
+    let (_, warnings) = warnings_on("topcoat_si::jev", || {
+        parsed(json!({"model": "m", "answers": {"bad": Value::Object(wide)}}))
+    });
+    assert!(warnings[0].len() < 400, "{}", warnings[0]);
 }

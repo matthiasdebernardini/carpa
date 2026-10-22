@@ -1,17 +1,20 @@
 use std::collections::HashSet;
 
-use serde::de::Error as DeError;
 use serde::ser::{SerializeStruct, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::types::{Message, MessageCreateParams};
+use crate::types::open_union;
+use crate::types::wire_tag::{ErrorTag, MessageBatchDeletedTag, MessageBatchTag};
+use crate::types::{ErrorType, Message, MessageCreateParams};
 
 const MAX_MESSAGE_BATCH_REQUESTS: usize = 100_000;
 const MAX_MESSAGE_BATCH_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Parameters for creating a Message Batch.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchCreateParams {
     /// Individual Messages API requests to process asynchronously.
     pub requests: Vec<MessageBatchCreateRequest>,
@@ -26,6 +29,7 @@ pub struct MessageBatchCreateParams {
 
 impl MessageBatchCreateParams {
     /// Create batch creation parameters from individual batch requests.
+    #[must_use]
     pub fn new(requests: Vec<MessageBatchCreateRequest>) -> Self {
         Self {
             requests,
@@ -34,12 +38,14 @@ impl MessageBatchCreateParams {
     }
 
     /// Set beta feature headers for this batch creation request.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
     }
 
     /// Add a single beta feature header for this batch creation request.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -95,34 +101,31 @@ impl MessageBatchCreateParams {
                 ));
             }
 
-            request.params.validate().map_err(|err| match err {
-                crate::Error::Validation { message, param } => crate::Error::validation(
-                    message,
-                    param.map(|param| format!("requests[{i}].params.{param}")),
-                ),
-                other => other,
-            })?;
+            request
+                .params
+                .validate()
+                .map_err(|err| err.rename_param(|param| format!("requests[{i}].params.{param}")))?;
         }
 
         let body = serde_json::to_vec(self).map_err(|e| {
-            crate::Error::serialization(
-                format!("Failed to serialize message batch create params: {e}"),
-                Some(Box::new(e)),
-            )
+            crate::Error::validation("Failed to serialize message batch create params", None)
+                .with_source(e)
         })?;
-        if body.len() > MAX_MESSAGE_BATCH_BODY_BYTES {
-            return Err(crate::Error::validation(
-                format!(
-                    "Serialized batch request size {} exceeds limit of {} bytes",
-                    body.len(),
-                    MAX_MESSAGE_BATCH_BODY_BYTES
-                ),
-                Some("requests".to_string()),
-            ));
-        }
-
-        Ok(())
+        check_body_size(body.len(), MAX_MESSAGE_BATCH_BODY_BYTES)
     }
+}
+
+/// Fails with [`crate::ErrorKind::RequestTooLarge`] when a serialized batch of `size` bytes is
+/// over `limit`.
+fn check_body_size(size: usize, limit: usize) -> crate::Result<()> {
+    if size > limit {
+        return Err(crate::Error::request_too_large(
+            "Serialized batch request exceeds the size limit",
+            size,
+            limit,
+        ));
+    }
+    Ok(())
 }
 
 impl Serialize for MessageBatchCreateParams {
@@ -138,6 +141,7 @@ impl Serialize for MessageBatchCreateParams {
 
 /// A single Messages API request within a Message Batch.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchCreateRequest {
     /// Caller-provided identifier used to match results back to requests.
     pub custom_id: String,
@@ -148,6 +152,7 @@ pub struct MessageBatchCreateRequest {
 
 impl MessageBatchCreateRequest {
     /// Create a batch request from a custom ID and message creation parameters.
+    #[must_use]
     pub fn new(custom_id: impl Into<String>, params: MessageCreateParams) -> Self {
         Self {
             custom_id: custom_id.into(),
@@ -168,7 +173,7 @@ impl Serialize for MessageBatchCreateRequest {
     }
 }
 
-struct MessageBatchRequestParams<'a>(&'a MessageCreateParams);
+struct MessageBatchRequestParams<'params>(&'params MessageCreateParams);
 
 impl Serialize for MessageBatchRequestParams<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -182,12 +187,9 @@ impl Serialize for MessageBatchRequestParams<'_> {
         len += usize::from(params.output_config.is_some());
         len += usize::from(params.stop_sequences.is_some());
         len += usize::from(params.system.is_some());
-        len += usize::from(params.temperature.is_some());
         len += usize::from(params.thinking.is_some());
         len += usize::from(params.tool_choice.is_some());
         len += usize::from(params.tools.is_some());
-        len += usize::from(params.top_k.is_some());
-        len += usize::from(params.top_p.is_some());
         len += usize::from(params.service_tier.is_some());
         len += usize::from(params.inference_geo.is_some());
         len += usize::from(params.container.is_some());
@@ -215,9 +217,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         if let Some(system) = &params.system {
             state.serialize_field("system", system)?;
         }
-        if let Some(temperature) = &params.temperature {
-            state.serialize_field("temperature", temperature)?;
-        }
         if let Some(thinking) = &params.thinking {
             state.serialize_field("thinking", thinking)?;
         }
@@ -226,12 +225,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         }
         if let Some(tools) = &params.tools {
             state.serialize_field("tools", tools)?;
-        }
-        if let Some(top_k) = &params.top_k {
-            state.serialize_field("top_k", top_k)?;
-        }
-        if let Some(top_p) = &params.top_p {
-            state.serialize_field("top_p", top_p)?;
         }
         if let Some(service_tier) = &params.service_tier {
             state.serialize_field("service_tier", service_tier)?;
@@ -260,13 +253,13 @@ impl Serialize for MessageBatchRequestParams<'_> {
 
 /// A Message Batch returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatch {
     /// Unique object identifier.
     pub id: String,
 
     /// Object type, always `"message_batch"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    r#type: MessageBatchTag,
 
     /// Current processing status for the batch.
     pub processing_status: MessageBatchProcessingStatus,
@@ -312,8 +305,9 @@ pub struct MessageBatch {
 }
 
 /// Processing status for a Message Batch.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageBatchProcessingStatus {
     /// The batch is actively processing.
     InProgress,
@@ -323,10 +317,32 @@ pub enum MessageBatchProcessingStatus {
 
     /// The batch has ended and no more requests will be processed.
     Ended,
+
+    /// A status this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for MessageBatchProcessingStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "MessageBatchProcessingStatus",
+            |value| match value {
+                "in_progress" => Some(Self::InProgress),
+                "canceling" => Some(Self::Canceling),
+                "ended" => Some(Self::Ended),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 /// Counts of individual batch requests by processing state.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchRequestCounts {
     /// Requests still being processed.
     pub processing: u32,
@@ -346,6 +362,7 @@ pub struct MessageBatchRequestCounts {
 
 /// Parameters for listing Message Batches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchListParams {
     /// ID of the object to use as a cursor for results after this object.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,35 +383,56 @@ pub struct MessageBatchListParams {
 
 impl MessageBatchListParams {
     /// Create empty list parameters.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the `after_id` cursor.
+    #[must_use]
     pub fn with_after_id(mut self, after_id: impl Into<String>) -> Self {
         self.after_id = Some(after_id.into());
         self
     }
 
     /// Set the `before_id` cursor.
+    #[must_use]
     pub fn with_before_id(mut self, before_id: impl Into<String>) -> Self {
         self.before_id = Some(before_id.into());
         self
     }
 
     /// Set the number of items to return.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
+    /// The query-string pairs for this request.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        if let Some(after_id) = &self.after_id {
+            pairs.push(("after_id".to_string(), after_id.clone()));
+        }
+        if let Some(before_id) = &self.before_id {
+            pairs.push(("before_id".to_string(), before_id.clone()));
+        }
+        if let Some(limit) = self.limit {
+            pairs.push(("limit".to_string(), limit.to_string()));
+        }
+        pairs
+    }
+
     /// Set beta feature headers for this list request.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
     }
 
     /// Add a single beta feature header for this list request.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -403,6 +441,7 @@ impl MessageBatchListParams {
 
 /// A page of Message Batch objects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchListResponse {
     /// Message Batch objects returned by the API.
     pub data: Vec<MessageBatch>,
@@ -421,6 +460,7 @@ pub struct MessageBatchListResponse {
 
 /// A single result line from a Message Batch results JSONL stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchResult {
     /// Caller-provided ID from the corresponding batch request.
     pub custom_id: String,
@@ -430,10 +470,11 @@ pub struct MessageBatchResult {
 }
 
 /// Result for a single request within a Message Batch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 // `Message` carries the response fields the API added; results are consumed one at a time.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum MessageBatchResultVariant {
     /// The request completed successfully and produced a message.
     #[serde(rename = "succeeded")]
@@ -456,14 +497,50 @@ pub enum MessageBatchResultVariant {
     /// The request expired before being sent to the model.
     #[serde(rename = "expired")]
     Expired,
+
+    /// A result of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for MessageBatchResultVariant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Succeeded {
+            message: Message,
+        }
+
+        #[derive(Deserialize)]
+        struct Errored {
+            error: MessageBatchErrorResponse,
+        }
+
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "succeeded" => {
+                open_union::from_value(value).map(|succeeded: Succeeded| Self::Succeeded {
+                    message: succeeded.message,
+                })
+            }
+            "errored" => open_union::from_value(value).map(|errored: Errored| Self::Errored {
+                error: errored.error,
+            }),
+            "canceled" => Ok(Self::Canceled),
+            "expired" => Ok(Self::Expired),
+            tag => {
+                open_union::warn_unknown("MessageBatchResultVariant", tag);
+                Ok(Self::Unknown(value))
+            }
+        }
+    }
 }
 
 /// Standard Anthropic error response embedded in a batch result.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchErrorResponse {
-    /// Object type, normally `"error"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    /// Object type, always `"error"`.
+    r#type: ErrorTag,
 
     /// Error details.
     pub error: MessageBatchError,
@@ -474,46 +551,35 @@ impl<'de> Deserialize<'de> for MessageBatchErrorResponse {
     where
         D: serde::Deserializer<'de>,
     {
+        /// The standard shape, `{"type": "error", "error": {...}}`.
         #[derive(Deserialize)]
-        struct Helper {
-            #[serde(rename = "type")]
-            r#type: Option<String>,
-            error: Option<MessageBatchError>,
-            message: Option<String>,
-            param: Option<String>,
+        struct Wrapped {
+            #[serde(default, rename = "type")]
+            _tag: ErrorTag,
+            error: MessageBatchError,
         }
 
-        let helper = Helper::deserialize(deserializer)?;
-        if let Some(error) = helper.error {
-            return Ok(Self {
-                r#type: helper.r#type.unwrap_or_else(|| "error".to_string()),
-                error,
-            });
-        }
-
-        let error_type = helper
-            .r#type
-            .ok_or_else(|| D::Error::missing_field("type"))?;
-        let message = helper
-            .message
-            .ok_or_else(|| D::Error::missing_field("message"))?;
+        // The `error` key, not a `type` value, tells the standard shape from the bare error
+        // details, so neither shape's `type` is read as the other's.
+        let value = Value::deserialize(deserializer)?;
+        let error = if value.get("error").is_some() {
+            open_union::from_value::<Wrapped, D::Error>(value)?.error
+        } else {
+            open_union::from_value(value)?
+        };
         Ok(Self {
-            r#type: "error".to_string(),
-            error: MessageBatchError {
-                r#type: error_type,
-                message,
-                param: helper.param,
-            },
+            r#type: ErrorTag,
+            error,
         })
     }
 }
 
 /// Error details for a failed request within a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchError {
     /// Anthropic error type.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    pub r#type: ErrorType,
 
     /// Human-readable error message.
     pub message: String,
@@ -525,13 +591,13 @@ pub struct MessageBatchError {
 
 /// Response returned after deleting a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeletedMessageBatch {
     /// Deleted batch ID.
     pub id: String,
 
     /// Object type, always `"message_batch_deleted"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    r#type: MessageBatchDeletedTag,
 }
 
 fn is_valid_custom_id(custom_id: &str) -> bool {
@@ -545,7 +611,10 @@ fn is_valid_custom_id(custom_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{KnownModel, MessageParam, Model, TextBlock, Usage};
+    use crate::types::{
+        CompactionRequest, InferenceSpeed, KnownModel, MessageParam, MessageRole, Model,
+        ServiceTierChoice, TextBlock, Usage,
+    };
     use serde_json::{json, to_value};
     use time::macros::datetime;
 
@@ -594,9 +663,27 @@ mod tests {
     }
 
     #[test]
+    fn batch_body_over_the_cap_is_request_too_large() {
+        let error = check_body_size(11, 10).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &crate::ErrorKind::RequestTooLarge {
+                size: 11,
+                limit: 10
+            }
+        );
+        assert!(!error.is_retryable());
+        assert!(check_body_size(10, 10).is_ok());
+        assert_eq!(MAX_MESSAGE_BATCH_BODY_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
     fn batch_create_params_reject_empty_requests() {
         let params = MessageBatchCreateParams::new(Vec::new());
-        assert!(params.validate().unwrap_err().is_validation());
+        assert!(matches!(
+            params.validate().unwrap_err().kind(),
+            crate::ErrorKind::Validation { .. }
+        ));
     }
 
     #[test]
@@ -605,14 +692,17 @@ mod tests {
             valid_batch_request("request_1");
             MAX_MESSAGE_BATCH_REQUESTS + 1
         ]);
-        assert!(params.validate().unwrap_err().is_validation());
+        assert!(matches!(
+            params.validate().unwrap_err().kind(),
+            crate::ErrorKind::Validation { .. }
+        ));
     }
 
     #[test]
     fn batch_create_params_reject_invalid_custom_id() {
         let params = MessageBatchCreateParams::new(vec![valid_batch_request("bad id")]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("custom_id"));
     }
 
@@ -623,7 +713,7 @@ mod tests {
             valid_batch_request("same-id"),
         ]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("Duplicate custom_id"));
     }
 
@@ -633,26 +723,39 @@ mod tests {
         request.params.stream = true;
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("stream"));
     }
 
     #[test]
     fn batch_create_params_reject_speed() {
         let mut request = valid_batch_request("fast");
-        request.params.speed = Some(crate::types::InferenceSpeed::Fast);
+        request.params.speed = Some(InferenceSpeed::Fast);
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("speed"));
+    }
+
+    #[test]
+    fn batch_create_params_reject_unknown_role() {
+        let mut request = valid_batch_request("unknown-role");
+        request.params.messages[0].role = MessageRole::Unknown;
+        let params = MessageBatchCreateParams::new(vec![request]);
+        let err = params.validate().unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Validation { param, .. }
+                if param.as_deref() == Some("requests[0].params.messages[0].role")),
+            "{err}"
+        );
     }
 
     #[test]
     fn batch_create_params_serialize_new_request_fields() {
         let mut request = valid_batch_request("new-fields");
-        request.params.service_tier = Some(crate::types::ServiceTierChoice::StandardOnly);
+        request.params.service_tier = Some(ServiceTierChoice::StandardOnly);
         request.params.inference_geo = Some("us".to_string());
-        request.params.compaction = Some(crate::types::CompactionRequest::new());
+        request.params.compaction = Some(CompactionRequest::new());
         let json = serde_json::to_value(MessageBatchCreateParams::new(vec![request])).unwrap();
         let params = &json["requests"][0]["params"];
         assert_eq!(params["service_tier"], "standard_only");
@@ -707,7 +810,7 @@ mod tests {
     fn message_batch_list_response_deserialization() {
         let batch = MessageBatch {
             id: "msgbatch_123".to_string(),
-            r#type: "message_batch".to_string(),
+            r#type: MessageBatchTag,
             processing_status: MessageBatchProcessingStatus::Ended,
             request_counts: MessageBatchRequestCounts {
                 processing: 0,
@@ -783,8 +886,8 @@ mod tests {
         let result: MessageBatchResult = serde_json::from_value(json).unwrap();
         match result.result {
             MessageBatchResultVariant::Errored { error } => {
-                assert_eq!(error.r#type, "error");
-                assert_eq!(error.error.r#type, "invalid_request_error");
+                assert_eq!(error.r#type, ErrorTag);
+                assert_eq!(error.error.r#type, ErrorType::InvalidRequestError);
             }
             _ => panic!("expected errored result"),
         }
@@ -806,11 +909,44 @@ mod tests {
         let result: MessageBatchResult = serde_json::from_value(json).unwrap();
         match result.result {
             MessageBatchResultVariant::Errored { error } => {
-                assert_eq!(error.r#type, "error");
-                assert_eq!(error.error.r#type, "invalid_request_error");
+                assert_eq!(error.r#type, ErrorTag);
+                assert_eq!(error.error.r#type, ErrorType::InvalidRequestError);
             }
             _ => panic!("expected errored result"),
         }
+    }
+
+    #[test]
+    fn batch_error_shapes_read_their_type_without_warnings() {
+        let standard = json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Overloaded"}
+        });
+        let direct = json!({"type": "overloaded_error", "message": "Overloaded"});
+        for shape in [standard.clone(), direct] {
+            let (error, warnings) = crate::test_support::unknown_warnings(|| {
+                serde_json::from_value::<MessageBatchErrorResponse>(shape).unwrap()
+            });
+            assert_eq!(warnings, Vec::<String>::new());
+            assert_eq!(error.error.r#type, ErrorType::OverloadedError);
+            assert_eq!(to_value(&error).unwrap(), standard);
+        }
+
+        let (error, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<MessageBatchErrorResponse>(json!({
+                "type": "error_v2",
+                "error": {"type": "brewing_error", "message": "Busy"}
+            }))
+            .unwrap()
+        });
+        assert_eq!(error.error.r#type, ErrorType::Unknown);
+        assert_eq!(
+            warnings,
+            [
+                "rust_type=ErrorTag tag=error_v2",
+                "rust_type=ErrorType tag=brewing_error"
+            ]
+        );
     }
 
     #[test]
@@ -841,13 +977,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(deleted.id, "msgbatch_123");
-        assert_eq!(deleted.r#type, "message_batch_deleted");
+        assert_eq!(deleted.r#type, MessageBatchDeletedTag);
     }
 
     #[test]
     fn message_batch_result_round_trip_succeeded() {
         let message = Message::new(
-            "msg_123".to_string(),
+            "msg_123",
             vec![TextBlock::new("Hello").into()],
             Model::Known(KnownModel::ClaudeOpus55),
             Usage::new(1, 1),

@@ -1,11 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
-use crate::types::usage_report::rfc3339;
+use crate::types::{InferenceSpeed, ServiceTier, open_union, usage_report};
 
 /// A dimension to group cost-report results by.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CostGroupBy {
     /// Group by line-item description (also returns model, token type and tier details).
     Description,
@@ -14,7 +15,7 @@ pub enum CostGroupBy {
 }
 
 impl CostGroupBy {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             CostGroupBy::Description => "description",
             CostGroupBy::WorkspaceId => "workspace_id",
@@ -26,6 +27,7 @@ impl CostGroupBy {
 ///
 /// The bucket width is always one day.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CostReportParams {
     /// Start of the reporting window (inclusive).
     pub starting_at: OffsetDateTime,
@@ -41,6 +43,7 @@ pub struct CostReportParams {
 
 impl CostReportParams {
     /// Create parameters reporting from `starting_at`.
+    #[must_use]
     pub fn new(starting_at: OffsetDateTime) -> Self {
         Self {
             starting_at,
@@ -52,52 +55,60 @@ impl CostReportParams {
     }
 
     /// Set the end of the reporting window.
+    #[must_use]
     pub fn with_ending_at(mut self, ending_at: OffsetDateTime) -> Self {
         self.ending_at = Some(ending_at);
         self
     }
 
     /// Add a grouping dimension.
+    #[must_use]
     pub fn group_by(mut self, group_by: CostGroupBy) -> Self {
         self.group_by.push(group_by);
         self
     }
 
     /// Set the maximum number of buckets to return.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Set the pagination cursor.
+    #[must_use]
     pub fn with_page(mut self, page: impl Into<String>) -> Self {
         self.page = Some(page.into());
         self
     }
 
-    /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
-    pub fn to_query(&self) -> String {
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("starting_at", &rfc3339(self.starting_at));
+    /// The query-string pairs for this request, repeating array keys with a `[]` suffix.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        pairs.push((
+            "starting_at".to_string(),
+            usage_report::rfc3339(self.starting_at),
+        ));
         if let Some(ending_at) = self.ending_at {
-            query.append_pair("ending_at", &rfc3339(ending_at));
+            pairs.push(("ending_at".to_string(), usage_report::rfc3339(ending_at)));
         }
-        query.append_pair("bucket_width", "1d");
+        pairs.push(("bucket_width".to_string(), "1d".to_string()));
         for group in &self.group_by {
-            query.append_pair("group_by[]", group.as_str());
+            pairs.push(("group_by[]".to_string(), group.as_str().to_string()));
         }
         if let Some(limit) = self.limit {
-            query.append_pair("limit", &limit.to_string());
+            pairs.push(("limit".to_string(), limit.to_string()));
         }
         if let Some(page) = &self.page {
-            query.append_pair("page", page);
+            pairs.push(("page".to_string(), page.clone()));
         }
-        query.finish()
+        pairs
     }
 }
 
 /// One cost line inside a cost bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostBucketResult {
     /// Decimal string in the currency's lowest unit (cents): `"123.78912"` is $1.2378912.
     pub amount: String,
@@ -106,21 +117,21 @@ pub struct CostBucketResult {
     /// Line-item description, when grouped by description.
     #[serde(default)]
     pub description: Option<String>,
-    /// Cost type, for example `"tokens"`.
+    /// What the cost is for, when grouped by description.
     #[serde(default)]
-    pub cost_type: Option<String>,
+    pub cost_type: Option<CostType>,
     /// Model identifier, when grouped by description.
     #[serde(default)]
     pub model: Option<String>,
-    /// Service tier, when grouped by description.
+    /// Service tier, when grouped by description; `standard` or `batch`.
     #[serde(default)]
-    pub service_tier: Option<String>,
+    pub service_tier: Option<ServiceTier>,
     /// Inference speed, when grouped by description.
     #[serde(default)]
-    pub speed: Option<String>,
+    pub speed: Option<InferenceSpeed>,
     /// Token type, when grouped by description.
     #[serde(default)]
-    pub token_type: Option<String>,
+    pub token_type: Option<TokenType>,
     /// Context window, when grouped by description.
     #[serde(default)]
     pub context_window: Option<String>,
@@ -137,6 +148,7 @@ impl CostBucketResult {
     ///
     /// The fraction is padded or truncated to 6 digits; no floats are involved.  Returns
     /// `None` for negatives, non-digits, or values that overflow `u64`.
+    #[must_use]
     pub fn amount_micro_cents(&self) -> Option<u64> {
         let (whole, fraction) = self
             .amount
@@ -158,8 +170,89 @@ impl CostBucketResult {
     }
 }
 
+/// What a cost-report line is for.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CostType {
+    /// Code execution.
+    CodeExecution,
+    /// Session usage.
+    SessionUsage,
+    /// Model tokens.
+    Tokens,
+    /// Web search.
+    WebSearch,
+    /// A cost type this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for CostType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "CostType",
+            |value| match value {
+                "code_execution" => Some(Self::CodeExecution),
+                "session_usage" => Some(Self::SessionUsage),
+                "tokens" => Some(Self::Tokens),
+                "web_search" => Some(Self::WebSearch),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
+}
+
+/// The kind of token a cost-report line bills.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
+pub enum TokenType {
+    /// Input tokens neither read from nor written to the cache.
+    #[serde(rename = "uncached_input_tokens")]
+    UncachedInputTokens,
+    /// Output tokens.
+    #[serde(rename = "output_tokens")]
+    OutputTokens,
+    /// Input tokens read from the cache.
+    #[serde(rename = "cache_read_input_tokens")]
+    CacheReadInputTokens,
+    /// Input tokens written to the 5-minute cache.
+    #[serde(rename = "cache_creation.ephemeral_5m_input_tokens")]
+    CacheCreationEphemeral5mInputTokens,
+    /// Input tokens written to the 1-hour cache.
+    #[serde(rename = "cache_creation.ephemeral_1h_input_tokens")]
+    CacheCreationEphemeral1hInputTokens,
+    /// A token type this crate does not know.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for TokenType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "TokenType",
+            |value| match value {
+                "uncached_input_tokens" => Some(Self::UncachedInputTokens),
+                "output_tokens" => Some(Self::OutputTokens),
+                "cache_read_input_tokens" => Some(Self::CacheReadInputTokens),
+                "cache_creation.ephemeral_5m_input_tokens" => {
+                    Some(Self::CacheCreationEphemeral5mInputTokens)
+                }
+                "cache_creation.ephemeral_1h_input_tokens" => {
+                    Some(Self::CacheCreationEphemeral1hInputTokens)
+                }
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
+}
+
 /// One daily bucket of a cost report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostBucket {
     /// Start of the bucket (inclusive).
     #[serde(with = "time::serde::rfc3339")]
@@ -173,6 +266,7 @@ pub struct CostBucket {
 
 /// A page of the Admin API cost report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostReport {
     /// The buckets on this page.
     pub data: Vec<CostBucket>,
@@ -186,6 +280,7 @@ pub struct CostReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::encode_query;
     use time::format_description::well_known::Rfc3339;
 
     const REPORT: &str = r#"{"data":[{"ending_at":"2025-08-02T00:00:00Z","results":[{"amount":"123.78912","context_window":"0-200k","cost_type":"tokens","currency":"USD","description":"Claude Opus 5.5 Usage - Input Tokens","inference_geo":"global","model":"claude-opus-5-5","service_tier":"standard","speed":"standard","token_type":"cache_creation.ephemeral_1h_input_tokens","workspace_id":"wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ"}],"starting_at":"2025-08-01T00:00:00Z"}],"has_more":true,"next_page":"page_MjAyNS0wNS0xNFQwMDowMDowMFo="}"#;
@@ -221,14 +316,25 @@ mod tests {
             result.description.as_deref(),
             Some("Claude Opus 5.5 Usage - Input Tokens")
         );
-        assert_eq!(result.cost_type.as_deref(), Some("tokens"));
+        assert_eq!(result.cost_type, Some(CostType::Tokens));
+        assert_eq!(result.speed, Some(InferenceSpeed::Standard));
         assert_eq!(result.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(
-            result.token_type.as_deref(),
-            Some("cache_creation.ephemeral_1h_input_tokens")
+            result.token_type,
+            Some(TokenType::CacheCreationEphemeral1hInputTokens)
         );
         assert_eq!(result.inference_geo.as_deref(), Some("global"));
         assert_eq!(result.amount_micro_cents(), Some(123_789_120));
+    }
+
+    #[test]
+    fn unknown_cost_speed_parses_and_warns_once() {
+        let line = serde_json::json!({"amount": "1", "currency": "USD", "speed": "ludicrous"});
+        let (result, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<CostBucketResult>(line).unwrap()
+        });
+        assert_eq!(result.speed, Some(InferenceSpeed::Unknown));
+        assert_eq!(warnings, ["rust_type=InferenceSpeed tag=ludicrous"]);
     }
 
     #[test]
@@ -250,9 +356,9 @@ mod tests {
             .group_by(CostGroupBy::Description)
             .group_by(CostGroupBy::WorkspaceId)
             .with_limit(31)
-            .to_query();
+            .query_pairs();
         assert_eq!(
-            query,
+            encode_query(query),
             "starting_at=2025-08-01T00%3A00%3A00Z&bucket_width=1d\
              &group_by%5B%5D=description&group_by%5B%5D=workspace_id&limit=31"
         );

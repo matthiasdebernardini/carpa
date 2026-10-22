@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::TextBlock;
+use crate::types::wire_tag::TextTag;
 
 /// A wrapper around TextBlock for system prompts that includes a type field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SystemTextBlock {
-    /// The type field, always "text".
-    pub r#type: String,
+    /// Block type, always `"text"`.
+    r#type: TextTag,
 
     /// The text content.
     #[serde(flatten)]
@@ -22,25 +24,6 @@ pub enum SystemPrompt {
 
     /// An array of text block parameters.
     Blocks(Vec<SystemTextBlock>),
-}
-
-impl SystemPrompt {
-    /// Create a new SystemPrompt from a string.
-    pub fn from_string(content: String) -> Self {
-        Self::String(content)
-    }
-
-    /// Create a new SystemPrompt from text blocks.
-    pub fn from_blocks(blocks: Vec<TextBlock>) -> Self {
-        let system_blocks = blocks
-            .into_iter()
-            .map(|block| SystemTextBlock {
-                r#type: "text".to_string(),
-                block,
-            })
-            .collect();
-        Self::Blocks(system_blocks)
-    }
 }
 
 impl From<String> for SystemPrompt {
@@ -60,7 +43,7 @@ impl From<Vec<TextBlock>> for SystemPrompt {
         let system_blocks = blocks
             .into_iter()
             .map(|block| SystemTextBlock {
-                r#type: "text".to_string(),
+                r#type: TextTag,
                 block,
             })
             .collect();
@@ -82,8 +65,8 @@ mod tests {
 
     #[test]
     fn system_prompt_blocks() {
-        let blocks = vec![TextBlock::new("You are a helpful assistant.".to_string())];
-        let prompt = SystemPrompt::from_blocks(blocks);
+        let blocks = vec![TextBlock::new("You are a helpful assistant.")];
+        let prompt = SystemPrompt::from(blocks);
         let json = to_value(&prompt).unwrap();
         assert_eq!(
             json,
@@ -96,7 +79,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        let prompt = SystemPrompt::from_string("Hello".to_string());
+        let prompt = SystemPrompt::from("Hello");
         assert_eq!(prompt, SystemPrompt::String("Hello".to_string()));
 
         let prompt: SystemPrompt = "Hello".into();
@@ -108,14 +91,11 @@ mod tests {
 
     #[test]
     fn from_blocks() {
-        let blocks = vec![TextBlock::new("Hello".to_string())];
-        let prompt = SystemPrompt::from_blocks(blocks.clone());
+        let blocks = vec![TextBlock::new("Hello")];
         let expected_blocks = vec![SystemTextBlock {
-            r#type: "text".to_string(),
-            block: TextBlock::new("Hello".to_string()),
+            r#type: TextTag,
+            block: TextBlock::new("Hello"),
         }];
-        assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks.clone()));
-
         let prompt: SystemPrompt = blocks.into();
         assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks));
     }

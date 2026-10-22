@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::types::open_union;
 
 /// Opt-in request for prompt-cache diagnostics.
 ///
@@ -6,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// pass the previous response `id` on later turns so the API can compare the two
 /// requests and report where they diverged. Generally available; no beta header.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiagnosticsRequest {
     /// The `id` of the previous response, or `None` on the first turn.
     ///
@@ -16,6 +19,7 @@ pub struct DiagnosticsRequest {
 
 impl DiagnosticsRequest {
     /// Opt in on the first turn of a conversation.
+    #[must_use]
     pub fn first_turn() -> Self {
         Self {
             previous_message_id: None,
@@ -23,6 +27,7 @@ impl DiagnosticsRequest {
     }
 
     /// Opt in on a later turn, comparing against the previous response.
+    #[must_use]
     pub fn after(previous_message_id: impl Into<String>) -> Self {
         Self {
             previous_message_id: Some(previous_message_id.into()),
@@ -39,6 +44,7 @@ impl DiagnosticsRequest {
 ///   from the previous one (`unavailable` also covers differences in
 ///   `tool_choice`, `thinking`, `output_config` or beta headers).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheDiagnostics {
     /// Why the cache missed, or `None` while the comparison is still running.
     #[serde(default)]
@@ -47,9 +53,10 @@ pub struct CacheDiagnostics {
 
 /// The earliest divergence between this request and the previous one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheMissReason {
-    /// One of the `*_CHANGED`, `PREVIOUS_MESSAGE_NOT_FOUND` or `UNAVAILABLE` types.
-    pub r#type: String,
+    /// Where the request diverged.
+    pub r#type: CacheMissType,
 
     /// Input tokens that missed the cache because of the divergence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,27 +64,55 @@ pub struct CacheMissReason {
 }
 
 impl CacheMissReason {
-    /// The model differs from the previous request.
-    pub const MODEL_CHANGED: &'static str = "model_changed";
-    /// The system prompt differs from the previous request.
-    pub const SYSTEM_CHANGED: &'static str = "system_changed";
-    /// The tools differ from the previous request.
-    pub const TOOLS_CHANGED: &'static str = "tools_changed";
-    /// The messages differ from the previous request.
-    pub const MESSAGES_CHANGED: &'static str = "messages_changed";
-    /// The previous message could not be found.
-    pub const PREVIOUS_MESSAGE_NOT_FOUND: &'static str = "previous_message_not_found";
-    /// The comparison could not be made.
-    pub const UNAVAILABLE: &'static str = "unavailable";
-
     /// Whether the miss is attributable to one of the four `*_changed` divergences.
+    #[must_use]
     pub fn is_changed(&self) -> bool {
         matches!(
-            self.r#type.as_str(),
-            Self::MODEL_CHANGED
-                | Self::SYSTEM_CHANGED
-                | Self::TOOLS_CHANGED
-                | Self::MESSAGES_CHANGED
+            self.r#type,
+            CacheMissType::ModelChanged
+                | CacheMissType::SystemChanged
+                | CacheMissType::ToolsChanged
+                | CacheMissType::MessagesChanged
+        )
+    }
+}
+
+/// The kind of [`CacheMissReason`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheMissType {
+    /// The model or speed differs from the previous request.
+    ModelChanged,
+    /// The system prompt differs from the previous request.
+    SystemChanged,
+    /// The tools differ from the previous request.
+    ToolsChanged,
+    /// An earlier message differs from the previous request.
+    MessagesChanged,
+    /// The API has no record of the previous message.
+    PreviousMessageNotFound,
+    /// The comparison could not be made.
+    Unavailable,
+    /// A kind this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for CacheMissType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "CacheMissType",
+            |value| match value {
+                "model_changed" => Some(Self::ModelChanged),
+                "system_changed" => Some(Self::SystemChanged),
+                "tools_changed" => Some(Self::ToolsChanged),
+                "messages_changed" => Some(Self::MessagesChanged),
+                "previous_message_not_found" => Some(Self::PreviousMessageNotFound),
+                "unavailable" => Some(Self::Unavailable),
+                _ => None,
+            },
+            Self::Unknown,
         )
     }
 }
@@ -106,7 +141,7 @@ mod tests {
         }))
         .unwrap();
         let reason = diagnostics.cache_miss_reason.unwrap();
-        assert_eq!(reason.r#type, CacheMissReason::SYSTEM_CHANGED);
+        assert_eq!(reason.r#type, CacheMissType::SystemChanged);
         assert_eq!(reason.cache_missed_input_tokens, Some(41850));
         assert!(reason.is_changed());
     }
@@ -120,19 +155,19 @@ mod tests {
 
     #[test]
     fn is_changed_only_for_changed_types() {
-        let make = |t: &str| CacheMissReason {
-            r#type: t.to_string(),
+        let make = |t: CacheMissType| CacheMissReason {
+            r#type: t,
             cache_missed_input_tokens: None,
         };
         for t in [
-            CacheMissReason::MODEL_CHANGED,
-            CacheMissReason::SYSTEM_CHANGED,
-            CacheMissReason::TOOLS_CHANGED,
-            CacheMissReason::MESSAGES_CHANGED,
+            CacheMissType::ModelChanged,
+            CacheMissType::SystemChanged,
+            CacheMissType::ToolsChanged,
+            CacheMissType::MessagesChanged,
         ] {
-            assert!(make(t).is_changed(), "{t}");
+            assert!(make(t).is_changed(), "{t:?}");
         }
-        assert!(!make(CacheMissReason::PREVIOUS_MESSAGE_NOT_FOUND).is_changed());
-        assert!(!make(CacheMissReason::UNAVAILABLE).is_changed());
+        assert!(!make(CacheMissType::PreviousMessageNotFound).is_changed());
+        assert!(!make(CacheMissType::Unavailable).is_changed());
     }
 }

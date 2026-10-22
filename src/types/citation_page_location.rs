@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to indicate a specific span of pages in a document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CitationPageLocation {
     /// The text that was cited
     pub cited_text: String,
@@ -28,15 +29,16 @@ pub struct CitationPageLocation {
 
 impl CitationPageLocation {
     /// Creates a new CitationPageLocation
+    #[must_use]
     pub fn new(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_page_number: i32,
         end_page_number: i32,
         document_title: Option<String>,
     ) -> Self {
         Self {
-            cited_text,
+            cited_text: cited_text.into(),
             document_index,
             document_title,
             end_page_number,
@@ -46,19 +48,10 @@ impl CitationPageLocation {
     }
 
     /// Sets the ID of the cited file
+    #[must_use]
     pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
         self.file_id = Some(file_id.into());
         self
-    }
-
-    /// Returns the number of pages in the citation span (exclusive end)
-    pub fn page_count(&self) -> i32 {
-        self.end_page_number - self.start_page_number
-    }
-
-    /// Returns true if the citation is only for a single page
-    pub fn is_single_page(&self) -> bool {
-        self.page_count() == 1
     }
 }
 
@@ -110,43 +103,5 @@ mod tests {
         assert_eq!(location.document_title, Some("Document Title".to_string()));
         assert_eq!(location.end_page_number, 5);
         assert_eq!(location.start_page_number, 3);
-    }
-
-    #[test]
-    fn page_count() {
-        let location = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 5,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        assert_eq!(location.page_count(), 2);
-    }
-
-    #[test]
-    fn is_single_page() {
-        let single_page = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 4,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        let multi_page = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 5,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        assert!(single_page.is_single_page());
-        assert!(!multi_page.is_single_page());
     }
 }

@@ -3,8 +3,9 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Controls how extended thinking content is returned in API responses.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ThinkingDisplay {
     /// Return summarized thinking text in `thinking` blocks.
     Summarized,
@@ -19,9 +20,11 @@ pub enum ThinkingDisplay {
 ///
 /// This can be disabled, adaptive, or enabled with a token budget. Display-aware
 /// variants add the API's `display` field without changing the JSON `type`.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub enum ThinkingConfig {
     /// Disabled thinking configuration.
+    #[default]
     Disabled,
 
     /// Adaptive thinking configuration.
@@ -69,6 +72,7 @@ impl ThinkingConfig {
     /// Returns the number of budget tokens configured for thinking.
     ///
     /// Returns 0 if thinking is disabled or adaptive.
+    #[must_use]
     pub fn num_tokens(&self) -> u32 {
         match self {
             ThinkingConfig::Disabled
@@ -83,25 +87,13 @@ impl ThinkingConfig {
     /// Create a new enabled thinking configuration with the given budget tokens.
     ///
     /// Budget tokens must be ≥1024.
+    #[must_use]
     pub fn enabled(budget_tokens: u32) -> Self {
         Self::Enabled { budget_tokens }
     }
 
-    /// Create a new enabled thinking configuration that requests summarized thinking.
-    ///
-    /// Budget tokens must be ≥1024.
-    pub fn enabled_summarized(budget_tokens: u32) -> Self {
-        Self::enabled(budget_tokens).with_display(ThinkingDisplay::Summarized)
-    }
-
-    /// Create a new enabled thinking configuration that omits thinking text.
-    ///
-    /// Budget tokens must be ≥1024.
-    pub fn enabled_omitted(budget_tokens: u32) -> Self {
-        Self::enabled(budget_tokens).with_display(ThinkingDisplay::Omitted)
-    }
-
     /// Create a new disabled thinking configuration.
+    #[must_use]
     pub fn disabled() -> Self {
         Self::Disabled
     }
@@ -109,36 +101,22 @@ impl ThinkingConfig {
     /// Create a thinking configuration that thinks between tool calls only.
     ///
     /// Sonnet 5.5 only, with effort `high` or below.
+    #[must_use]
     pub fn between_tools() -> Self {
         Self::BetweenTools
     }
 
     /// Create a new adaptive thinking configuration.
+    #[must_use]
     pub fn adaptive() -> Self {
         Self::Adaptive
-    }
-
-    /// Create a new adaptive thinking configuration that requests summarized thinking.
-    pub fn adaptive_summarized() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Summarized)
-    }
-
-    /// Create a new adaptive thinking configuration that omits thinking text.
-    pub fn adaptive_omitted() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Omitted)
-    }
-
-    /// Create adaptive thinking that emits readable progress updates.
-    ///
-    /// Requires the `thinking-display-updates-2026-08-18` beta header.
-    pub fn adaptive_updates() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Updates)
     }
 
     /// Set how thinking content should be returned.
     ///
     /// `display` is only valid for enabled or adaptive thinking. Calling this on
     /// disabled or between-tools thinking leaves it unchanged.
+    #[must_use]
     pub fn with_display(self, display: ThinkingDisplay) -> Self {
         match self {
             ThinkingConfig::Disabled => ThinkingConfig::Disabled,
@@ -157,6 +135,7 @@ impl ThinkingConfig {
     }
 
     /// Returns the configured thinking display mode, if any.
+    #[must_use]
     pub fn display(&self) -> Option<ThinkingDisplay> {
         match self {
             ThinkingConfig::AdaptiveWithDisplay { display }
@@ -222,22 +201,31 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            Disabled,
+            Adaptive,
+            BetweenTools,
+            Enabled,
+        }
+
+        #[derive(Deserialize)]
         struct RawThinkingConfig {
             #[serde(rename = "type")]
-            kind: String,
+            kind: Kind,
             budget_tokens: Option<u32>,
             display: Option<ThinkingDisplay>,
         }
 
         let raw = RawThinkingConfig::deserialize(deserializer)?;
-        match raw.kind.as_str() {
-            "disabled" => Ok(ThinkingConfig::Disabled),
-            "between_tools" => Ok(ThinkingConfig::BetweenTools),
-            "adaptive" => Ok(match raw.display {
+        match raw.kind {
+            Kind::Disabled => Ok(ThinkingConfig::Disabled),
+            Kind::BetweenTools => Ok(ThinkingConfig::BetweenTools),
+            Kind::Adaptive => Ok(match raw.display {
                 Some(display) => ThinkingConfig::AdaptiveWithDisplay { display },
                 None => ThinkingConfig::Adaptive,
             }),
-            "enabled" => {
+            Kind::Enabled => {
                 let budget_tokens = raw
                     .budget_tokens
                     .ok_or_else(|| de::Error::missing_field("budget_tokens"))?;
@@ -249,17 +237,7 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
                     None => ThinkingConfig::Enabled { budget_tokens },
                 })
             }
-            other => Err(de::Error::unknown_variant(
-                other,
-                &["disabled", "adaptive", "between_tools", "enabled"],
-            )),
         }
-    }
-}
-
-impl Default for ThinkingConfig {
-    fn default() -> Self {
-        Self::disabled()
     }
 }
 
@@ -385,7 +363,7 @@ mod tests {
 
     #[test]
     fn thinking_config_enabled_summarized_serialization() {
-        let config = ThinkingConfig::enabled_summarized(2048);
+        let config = ThinkingConfig::enabled(2048).with_display(ThinkingDisplay::Summarized);
         let json = to_value(config).unwrap();
 
         assert_eq!(
@@ -400,7 +378,7 @@ mod tests {
 
     #[test]
     fn thinking_config_adaptive_summarized_serialization() {
-        let config = ThinkingConfig::adaptive_summarized();
+        let config = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
         let json = to_value(config).unwrap();
 
         assert_eq!(

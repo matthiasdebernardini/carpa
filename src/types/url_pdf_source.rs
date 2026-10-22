@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to provide a PDF to the model from a URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct UrlPdfSource {
     /// The URL of the PDF.
     pub url: String,
@@ -11,13 +12,9 @@ pub struct UrlPdfSource {
 
 impl UrlPdfSource {
     /// Creates a new UrlPdfSource with the specified URL.
-    pub fn new<S: Into<String>>(url: S) -> Self {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
-    }
-
-    /// Checks if the URL has a PDF file extension.
-    pub fn has_pdf_extension(&self) -> bool {
-        self.url.to_lowercase().ends_with(".pdf")
     }
 }
 
@@ -43,17 +40,5 @@ mod tests {
         let source: UrlPdfSource = serde_json::from_value(json).unwrap();
 
         assert_eq!(source.url, "https://example.com/document.pdf");
-    }
-
-    #[test]
-    fn has_pdf_extension() {
-        let source = UrlPdfSource::new("https://example.com/document.pdf");
-        assert!(source.has_pdf_extension());
-
-        let source = UrlPdfSource::new("https://example.com/document.PDF");
-        assert!(source.has_pdf_extension());
-
-        let source = UrlPdfSource::new("https://example.com/document.docx");
-        assert!(!source.has_pdf_extension());
     }
 }

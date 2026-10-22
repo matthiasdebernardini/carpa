@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// to a signature, typically associated with thinking blocks where the model's
 /// reasoning process needs to be cryptographically signed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SignatureDelta {
     /// The signature content.
     ///
@@ -16,16 +17,11 @@ pub struct SignatureDelta {
 
 impl SignatureDelta {
     /// Create a new `SignatureDelta` with the given signature.
-    pub fn new(signature: String) -> Self {
-        Self { signature }
-    }
-}
-
-impl std::str::FromStr for SignatureDelta {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.to_string()))
+    #[must_use]
+    pub fn new(signature: impl Into<String>) -> Self {
+        Self {
+            signature: signature.into(),
+        }
     }
 }
 
@@ -36,7 +32,7 @@ mod tests {
 
     #[test]
     fn signature_delta_serialization() {
-        let delta = SignatureDelta::new("Robert Paulson".to_string());
+        let delta = SignatureDelta::new("Robert Paulson");
         let json = to_value(&delta).unwrap();
 
         assert_eq!(
@@ -54,12 +50,6 @@ mod tests {
         });
 
         let delta: SignatureDelta = serde_json::from_value(json).unwrap();
-        assert_eq!(delta.signature, "Robert Paulson");
-    }
-
-    #[test]
-    fn from_str() {
-        let delta = "Robert Paulson".parse::<SignatureDelta>().unwrap();
         assert_eq!(delta.signature, "Robert Paulson");
     }
 }

@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    CodeExecutionTool, McpToolset, MemoryTool, ToolBash20241022, ToolBash20250124, ToolParam,
-    ToolSearchTool, ToolTextEditor20250124, ToolTextEditor20250429, ToolTextEditor20250728,
+    BashTool, CodeExecutionTool, McpToolset, MemoryTool, TextEditorTool, ToolParam, ToolSearchTool,
     WebFetchTool,
 };
 
@@ -16,9 +15,12 @@ use crate::types::{
 /// - The client-side memory tool
 /// - MCP toolsets
 ///
-/// The API accepts any of these tool types when tools are provided to Claude.
+/// The API accepts any of these tool types when tools are provided to Claude. Build one with its
+/// variant and the tool type's constructor, for example
+/// `ToolUnionParam::WebFetch20260318(WebFetchTool::new())`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ToolUnionParam {
     /// A custom tool with a defined schema
     #[serde(rename = "custom")]
@@ -26,23 +28,23 @@ pub enum ToolUnionParam {
 
     /// A bash tool for executing shell commands (version 20241022)
     #[serde(rename = "bash_20241022")]
-    Bash20241022(ToolBash20241022),
+    Bash20241022(BashTool),
 
     /// A bash tool for executing shell commands (version 20250124)
     #[serde(rename = "bash_20250124")]
-    Bash20250124(ToolBash20250124),
+    Bash20250124(BashTool),
 
     /// A text editor tool for making changes to text
     #[serde(rename = "text_editor_20250124")]
-    TextEditor20250124(ToolTextEditor20250124),
+    TextEditor20250124(TextEditorTool),
 
     /// A text editor tool for making changes to text (version 20250429)
     #[serde(rename = "text_editor_20250429")]
-    TextEditor20250429(ToolTextEditor20250429),
+    TextEditor20250429(TextEditorTool),
 
     /// A text editor tool for making changes to text (version 20250728)
     #[serde(rename = "text_editor_20250728")]
-    TextEditor20250728(ToolTextEditor20250728),
+    TextEditor20250728(TextEditorTool),
 
     /// A web fetch tool (version 20250910)
     #[serde(rename = "web_fetch_20250910")]
@@ -91,65 +93,9 @@ pub enum ToolUnionParam {
 
 impl ToolUnionParam {
     /// Creates a new custom tool
-    pub fn new_custom_tool(name: String, input_schema: serde_json::Value) -> Self {
+    #[must_use]
+    pub fn new_custom_tool(name: impl Into<String>, input_schema: serde_json::Value) -> Self {
         Self::CustomTool(ToolParam::new(name, input_schema))
-    }
-
-    /// Creates a new bash tool (version 20241022)
-    pub fn new_bash_20241022_tool() -> Self {
-        Self::Bash20241022(ToolBash20241022::new())
-    }
-
-    /// Creates a new bash tool (version 20250124)
-    pub fn new_bash_tool() -> Self {
-        Self::Bash20250124(ToolBash20250124::new())
-    }
-
-    /// Creates a new text editor tool
-    pub fn new_text_editor_tool() -> Self {
-        Self::TextEditor20250124(ToolTextEditor20250124::new())
-    }
-
-    /// Creates a new text editor tool (version 20250429)
-    pub fn new_text_editor_20250429_tool() -> Self {
-        Self::TextEditor20250429(ToolTextEditor20250429::new())
-    }
-
-    /// Creates a new text editor tool (version 20250728)
-    pub fn new_text_editor_20250728_tool() -> Self {
-        Self::TextEditor20250728(ToolTextEditor20250728::new())
-    }
-
-    /// Creates a new web fetch tool (version 20260318)
-    pub fn new_web_fetch_tool() -> Self {
-        Self::WebFetch20260318(WebFetchTool::new())
-    }
-
-    /// Creates a new code execution tool (version 20260521)
-    pub fn new_code_execution_tool() -> Self {
-        Self::CodeExecution20260521(CodeExecutionTool::new())
-    }
-
-    /// Creates a new regex tool search tool
-    pub fn new_tool_search_regex_tool() -> Self {
-        Self::ToolSearchToolRegex20251119(ToolSearchTool::regex())
-    }
-
-    /// Creates a new BM25 tool search tool
-    pub fn new_tool_search_bm25_tool() -> Self {
-        Self::ToolSearchToolBm2520251119(ToolSearchTool::bm25())
-    }
-
-    /// Creates a new memory tool.
-    ///
-    /// This is a client-side tool: the application implements the memory commands.
-    pub fn new_memory_tool() -> Self {
-        Self::Memory20250818(MemoryTool::new())
-    }
-
-    /// Creates a toolset exposing the tools of the named MCP server
-    pub fn new_mcp_toolset(server_name: impl Into<String>) -> Self {
-        Self::McpToolset(McpToolset::new(server_name))
     }
 
     /// Validate tool-specific constraints.
@@ -175,33 +121,6 @@ impl ToolUnionParam {
         }
         Ok(())
     }
-
-    /// Check if this tool has strict mode enabled.
-    ///
-    /// Only custom tools can have strict mode enabled. All other tool types
-    /// return `false`.
-    pub fn is_strict(&self) -> bool {
-        match self {
-            Self::CustomTool(tool) => tool.strict == Some(true),
-            // Built-in tools don't support strict mode
-            Self::Bash20241022(_)
-            | Self::Bash20250124(_)
-            | Self::TextEditor20250124(_)
-            | Self::TextEditor20250429(_)
-            | Self::TextEditor20250728(_)
-            | Self::WebFetch20250910(_)
-            | Self::WebFetch20260209(_)
-            | Self::WebFetch20260309(_)
-            | Self::WebFetch20260318(_)
-            | Self::CodeExecution20250825(_)
-            | Self::CodeExecution20260120(_)
-            | Self::CodeExecution20260521(_)
-            | Self::ToolSearchToolRegex20251119(_)
-            | Self::ToolSearchToolBm2520251119(_)
-            | Self::Memory20250818(_)
-            | Self::McpToolset(_) => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -222,8 +141,8 @@ mod tests {
             }
         });
 
-        let custom_tool = ToolParam::new("search".to_string(), input_schema)
-            .with_description("Search for information".to_string())
+        let custom_tool = ToolParam::new("search", input_schema)
+            .with_description("Search for information")
             .with_cache_control(CacheControlEphemeral::new());
 
         let tool = ToolUnionParam::CustomTool(custom_tool);
@@ -253,7 +172,7 @@ mod tests {
 
     #[test]
     fn bash_20241022_tool() {
-        let bash_tool = ToolBash20241022::new().with_ephemeral_cache_control();
+        let bash_tool = BashTool::new().with_ephemeral_cache_control();
         let tool = ToolUnionParam::Bash20241022(bash_tool);
 
         let json = to_value(&tool).unwrap();
@@ -271,7 +190,7 @@ mod tests {
 
     #[test]
     fn bash_20250124_tool() {
-        let bash_tool = ToolBash20250124::new().with_ephemeral_cache_control();
+        let bash_tool = BashTool::new().with_ephemeral_cache_control();
         let tool = ToolUnionParam::Bash20250124(bash_tool);
 
         let json = to_value(&tool).unwrap();
@@ -289,7 +208,7 @@ mod tests {
 
     #[test]
     fn text_editor_tool() {
-        let text_editor_tool = ToolTextEditor20250124::new().with_ephemeral_cache_control();
+        let text_editor_tool = TextEditorTool::new_20250124().with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250124(text_editor_tool);
 
         let json = to_value(&tool).unwrap();
@@ -307,7 +226,7 @@ mod tests {
 
     #[test]
     fn text_editor_20250429_tool() {
-        let text_editor_tool = ToolTextEditor20250429::new().with_ephemeral_cache_control();
+        let text_editor_tool = TextEditorTool::new_20250429().with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250429(text_editor_tool);
 
         let json = to_value(&tool).unwrap();
@@ -325,7 +244,7 @@ mod tests {
 
     #[test]
     fn text_editor_20250728_tool() {
-        let text_editor_tool = ToolTextEditor20250728::new()
+        let text_editor_tool = TextEditorTool::new_20250728()
             .with_max_characters(5000)
             .with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250728(text_editor_tool);
@@ -416,7 +335,7 @@ mod tests {
                 json!({"type": "web_fetch_20260309", "name": "web_fetch", "use_cache": true}),
             ),
             (
-                ToolUnionParam::new_web_fetch_tool(),
+                ToolUnionParam::WebFetch20260318(WebFetchTool::new()),
                 json!({"type": "web_fetch_20260318", "name": "web_fetch"}),
             ),
             (
@@ -428,23 +347,23 @@ mod tests {
                 json!({"type": "code_execution_20260120", "name": "code_execution"}),
             ),
             (
-                ToolUnionParam::new_code_execution_tool(),
+                ToolUnionParam::CodeExecution20260521(CodeExecutionTool::new()),
                 json!({"type": "code_execution_20260521", "name": "code_execution"}),
             ),
             (
-                ToolUnionParam::new_tool_search_regex_tool(),
+                ToolUnionParam::ToolSearchToolRegex20251119(ToolSearchTool::regex()),
                 json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
             ),
             (
-                ToolUnionParam::new_tool_search_bm25_tool(),
+                ToolUnionParam::ToolSearchToolBm2520251119(ToolSearchTool::bm25()),
                 json!({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}),
             ),
             (
-                ToolUnionParam::new_memory_tool(),
+                ToolUnionParam::Memory20250818(MemoryTool::new()),
                 json!({"type": "memory_20250818", "name": "memory"}),
             ),
             (
-                ToolUnionParam::new_mcp_toolset("docs"),
+                ToolUnionParam::McpToolset(McpToolset::new("docs")),
                 json!({"type": "mcp_toolset", "mcp_server_name": "docs"}),
             ),
         ];
@@ -452,7 +371,6 @@ mod tests {
             assert_eq!(to_value(&tool).unwrap(), expected);
             let parsed: ToolUnionParam = serde_json::from_value(expected).unwrap();
             assert_eq!(parsed, tool);
-            assert!(!tool.is_strict());
         }
     }
 
@@ -463,7 +381,11 @@ mod tests {
         let err = ToolUnionParam::WebFetch20260318(tool)
             .validate()
             .unwrap_err();
-        assert!(err.is_validation());
-        assert!(ToolUnionParam::new_web_fetch_tool().validate().is_ok());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
+        assert!(
+            ToolUnionParam::WebFetch20260318(WebFetchTool::new())
+                .validate()
+                .is_ok()
+        );
     }
 }

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// content, typically for tool input parameters. The JSON is streamed as fragments
 /// that need to be concatenated to form the complete JSON object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InputJsonDelta {
     /// The partial JSON content.
     ///
@@ -17,16 +18,11 @@ pub struct InputJsonDelta {
 
 impl InputJsonDelta {
     /// Create a new `InputJsonDelta` with the given partial JSON.
-    pub fn new(partial_json: String) -> Self {
-        Self { partial_json }
-    }
-}
-
-impl std::str::FromStr for InputJsonDelta {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.to_string()))
+    #[must_use]
+    pub fn new(partial_json: impl Into<String>) -> Self {
+        Self {
+            partial_json: partial_json.into(),
+        }
     }
 }
 
@@ -56,11 +52,5 @@ mod tests {
 
         let delta: InputJsonDelta = serde_json::from_value(json).unwrap();
         assert_eq!(delta.partial_json, r#"{"key":"#);
-    }
-
-    #[test]
-    fn from_str() {
-        let delta = "partial json".parse::<InputJsonDelta>().unwrap();
-        assert_eq!(delta.partial_json, "partial json");
     }
 }

@@ -1,16 +1,23 @@
 #![cfg(test)]
 
-use std::sync::Mutex;
-use std::sync::atomic::AtomicUsize;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use monty_pool::PoolConfig;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::pack::untyped;
+use super::tool::{CANCELLED, RESTARTED, TOOL_NAME, definition};
 use super::*;
+use crate::client_tool::ClientTool;
+use crate::error::{Error, ErrorKind};
 use crate::firecrawl::FirecrawlClient;
 use crate::jev::JevClient;
 use crate::test_support::{Canned, serve};
 use crate::types::{KnownModel, MessageCreateParams, MessageParam, Model, ToolResultBlockContent};
+use crate::types::{ToolResultBlock, ToolUnionParam, ToolUseBlock};
 use crate::{Anthropic, FirecrawlFetchPage, FirecrawlWebSearch};
 
 async fn test_pool() -> Arc<Pool> {
@@ -69,7 +76,7 @@ fn counted_search(calls: Arc<AtomicUsize>) -> impl HostFunction {
 
 fn host(
     name: &'static str,
-    function: impl Fn(Value) -> std::result::Result<Value, HostError> + Send + Sync + 'static,
+    function: impl Fn(Value) -> Result<Value, HostError> + Send + Sync + 'static,
 ) -> impl HostFunction {
     let function = Arc::new(function);
     host_fn(
@@ -137,9 +144,10 @@ fn fake_jev() -> Pack {
 }
 
 fn firecrawl_client(url: &str) -> FirecrawlClient {
-    FirecrawlClient::new("fc-test-key")
+    FirecrawlClient::try_new("fc-test-key")
         .unwrap()
         .with_base_url(url)
+        .unwrap()
         .with_max_retries(0)
 }
 
@@ -177,25 +185,23 @@ fn search_response() -> Canned {
 
 #[tokio::test]
 async fn reports_pack_examples_pass() {
-    testing::check_pack(test_pool().await, packs::reports(), vec![])
+    testing::check_pack(test_pool().await, packs::reports, Vec::new)
         .await
         .unwrap();
 }
 
 #[tokio::test]
 async fn research_pack_examples_pass() {
-    testing::check_pack(
-        test_pool().await,
-        packs::research(),
-        vec![fake_firecrawl(), fake_jev()],
-    )
+    testing::check_pack(test_pool().await, packs::research, || {
+        vec![fake_firecrawl(), fake_jev()]
+    })
     .await
     .unwrap();
 }
 
 #[tokio::test]
 async fn triage_pack_examples_pass() {
-    testing::check_pack(test_pool().await, packs::triage(), vec![fake_jev()])
+    testing::check_pack(test_pool().await, packs::triage, || vec![fake_jev()])
         .await
         .unwrap();
 }
@@ -213,9 +219,13 @@ async fn firecrawl_pack_examples_pass() {
     ])
     .await;
     let search = FirecrawlWebSearch::new(firecrawl_client(&url));
-    testing::check_pack(test_pool().await, firecrawl_pack(&url, search, 100), vec![])
-        .await
-        .unwrap();
+    testing::check_pack(
+        test_pool().await,
+        || firecrawl_pack(&url, search.clone(), 100),
+        Vec::new,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -234,11 +244,11 @@ async fn jev_pack_examples_pass() {
         ok(json!({"model": "jev-1.13.0", "answers": {"refund": {"type": "noul", "noul": 0.99}}})),
     ])
     .await;
-    let client = JevClient::new("ts-key", "jev-1.13.0")
+    let client = JevClient::try_new("ts-key", "jev-1.13.0")
         .unwrap()
         .with_base_url(&url)
         .unwrap();
-    testing::check_pack(test_pool().await, packs::jev(client), vec![])
+    testing::check_pack(test_pool().await, || packs::jev(client.clone()), Vec::new)
         .await
         .unwrap();
 }
@@ -292,8 +302,8 @@ async fn run_tools_gathers_host_calls_concurrently() {
     let pack = Pack::new("fakes", "timed fakes")
         .with_host(timed("search", spans.clone()))
         .with_host(timed("rate", spans.clone()));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
-    let client = Anthropic::new(Some("test_key".to_string()))
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let client = Anthropic::try_new(Some("test_key".to_string()))
         .unwrap()
         .with_base_url(base_url)
         .unwrap()
@@ -333,7 +343,7 @@ async fn run_tools_gathers_host_calls_concurrently() {
 async fn misspelled_function_raises_name_error_without_host_call() {
     let calls = Arc::new(AtomicUsize::new(0));
     let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let (text, is_error) = run(&code, "await serch(query=\"x\")").await;
     assert!(is_error);
     assert!(text.contains("NameError"), "{text}");
@@ -345,7 +355,7 @@ async fn misspelled_function_raises_name_error_without_host_call() {
 async fn unknown_keyword_raises_type_error_and_costs_nothing() {
     let calls = Arc::new(AtomicUsize::new(0));
     let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let (text, is_error) = run(&code, "await search(query=\"x\", limt=3)").await;
     assert!(is_error);
     assert!(
@@ -372,7 +382,7 @@ async fn raised_value_error_is_catchable() {
             message: "bad value".to_string(),
         })
     }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let snippet = "try:\n    await check()\nexcept ValueError as e:\n    caught = str(e)\ncaught";
     assert_eq!(
         run(&code, snippet).await,
@@ -383,7 +393,7 @@ async fn raised_value_error_is_catchable() {
 #[tokio::test]
 async fn slow_host_function_raises_runtime_error_and_keeps_the_session() {
     let pack = Pack::new("fakes", "fakes").with_host(slow());
-    let mut code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let mut code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     code.host_timeout = Duration::from_millis(200);
     let (text, is_error) = run(&code, "kept = 7\nawait slow()").await;
     assert!(is_error);
@@ -403,10 +413,10 @@ async fn fatal_host_error_makes_run_tools_fail() {
     )])
     .await;
     let pack = Pack::new("fakes", "fakes").with_host(host("boom", |_| {
-        Err(HostError::Fatal(Error::authentication("rejected key")))
+        Err(HostError::Fatal(Error::tool("rejected key", None)))
     }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
-    let client = Anthropic::new(Some("test_key".to_string()))
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let client = Anthropic::try_new(Some("test_key".to_string()))
         .unwrap()
         .with_base_url(base_url)
         .unwrap()
@@ -417,14 +427,14 @@ async fn fatal_host_error_makes_run_tools_fail() {
         Model::Known(KnownModel::ClaudeSonnet55),
     );
     let error = client.run_tools(params, &[&code], 5).await.unwrap_err();
-    assert!(error.is_authentication(), "{error}");
+    assert_eq!(error.error.kind(), &ErrorKind::Tool, "{error}");
     assert!(code.session.lock().await.is_none());
 }
 
 #[tokio::test]
 async fn budget_runs_out_at_call_51_for_sequential_awaits() {
     let pack = Pack::new("fakes", "fakes").with_host(host("ping", |_| Ok(json!(1))));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let snippet = "n = 0\nmessage = None\nfor i in range(51):\n    try:\n        n += await ping()\n    \
                    except RuntimeError as e:\n        message = str(e)\n(n, message)";
     assert_eq!(
@@ -443,7 +453,7 @@ async fn budget_runs_out_at_call_51_for_sequential_awaits() {
 #[tokio::test]
 async fn call_from_an_earlier_snippet_raises_and_costs_nothing() {
     let pack = Pack::new("fakes", "fakes").with_host(host("ping", |_| Ok(json!(1))));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let (_, is_error) = run(&code, "pending = ping()").await;
     assert!(!is_error);
     let (text, is_error) = run(&code, "await pending").await;
@@ -467,7 +477,7 @@ async fn call_from_an_earlier_snippet_raises_and_costs_nothing() {
 
 #[tokio::test]
 async fn variables_persist_across_calls_and_errors() {
-    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], Limits::default()).unwrap();
     assert_eq!(run(&code, "x = 1").await, ("=> None".to_string(), false));
     assert_eq!(run(&code, "x + 1").await, ("=> 2".to_string(), false));
     let (text, is_error) = run(&code, "y = 5\nraise ValueError('boom')").await;
@@ -487,7 +497,7 @@ async fn memory_limit_restarts_the_session() {
         max_memory: 16 * 1024 * 1024,
         ..Limits::default()
     };
-    let code = CodeMode::new(test_pool().await, vec![], limits).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], limits).unwrap();
     assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
     let (text, is_error) = run(&code, "big = 'a' * (64 * 1024 * 1024)\nlen(big)").await;
     assert!(is_error);
@@ -501,7 +511,7 @@ async fn memory_limit_restarts_the_session() {
 #[tokio::test]
 async fn cancelled_call_leaves_a_fresh_working_session() {
     let pack = Pack::new("fakes", "fakes").with_host(slow());
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
     let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "await slow()"}));
     let cancelled = tokio::time::timeout(Duration::from_millis(300), code.call(&tool_use)).await;
@@ -522,10 +532,10 @@ async fn cancelled_call_leaves_a_fresh_working_session() {
 // 5. Validation.
 
 #[tokio::test]
-async fn invalid_packs_fail_in_new() {
+async fn invalid_packs_fail_in_try_new() {
     let pool = test_pool().await;
     let ping = || host("ping", |_| Ok(json!(1)));
-    let duplicate = CodeMode::new(
+    let duplicate = CodeMode::try_new(
         pool.clone(),
         vec![
             Pack::new("a", "a").with_host(ping()),
@@ -541,9 +551,9 @@ async fn invalid_packs_fail_in_new() {
             .contains("two functions are named ping")
     );
 
-    let missing = CodeMode::new(
+    let missing = CodeMode::try_new(
         pool.clone(),
-        vec![Pack::new("a", "a").requires(&["jev"])],
+        vec![Pack::new("a", "a").requires(["jev"])],
         Limits::default(),
     );
     assert!(
@@ -554,12 +564,31 @@ async fn invalid_packs_fail_in_new() {
             .contains("requires pack jev")
     );
 
-    let help = CodeMode::new(
+    let help = CodeMode::try_new(
         pool,
         vec![Pack::new("a", "a").with_host(host("help", |_| Ok(json!(1))))],
         Limits::default(),
     );
     assert!(help.err().unwrap().to_string().contains("reserved"));
+}
+
+#[tokio::test]
+async fn max_output_chars_under_the_result_reserve_is_rejected() {
+    let mut config = PoolConfig::subprocess("monty");
+    config.min_processes = 0;
+    let idle = Arc::new(Pool::new(config).await.unwrap());
+    let limits = Limits {
+        max_output_chars: 1000,
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(idle, vec![], limits).err().unwrap();
+    assert!(
+        matches!(
+            error.kind(),
+            ErrorKind::Validation { param: Some(param) } if param == "max_output_chars"
+        ),
+        "{error}"
+    );
 }
 
 // 6. Values.
@@ -572,7 +601,7 @@ async fn values_cross_both_ways() {
         counter.fetch_add(1, Ordering::SeqCst);
         Ok(args)
     }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     assert_eq!(
         run(
             &code,
@@ -618,7 +647,7 @@ async fn firecrawl_pack_keeps_the_tool_policy() {
     let search = FirecrawlWebSearch::new(firecrawl_client(&url))
         .with_blocked_domains(vec!["blocked.com".to_string()]);
     let pack = firecrawl_pack(&url, search, 100);
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
 
     let (text, is_error) = run(
         &code,
@@ -644,7 +673,7 @@ async fn firecrawl_pack_keeps_the_tool_policy() {
         json!({"code": "await search(query='x')"}),
     );
     let error = code.call(&tool_use).await.unwrap_err();
-    assert_eq!(error.status_code(), Some(402));
+    assert_eq!(error.status(), Some(402));
 }
 
 #[tokio::test]
@@ -652,7 +681,7 @@ async fn firecrawl_credit_budget_stops_calls() {
     let (url, recorded) = serve(vec![search_response()]).await;
     let search = FirecrawlWebSearch::new(firecrawl_client(&url));
     let pack = firecrawl_pack(&url, search, 2);
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     assert_eq!(
         run(&code, "len(await search(query='x'))").await,
         ("=> 2".to_string(), false)
@@ -672,7 +701,7 @@ async fn firecrawl_credit_budget_stops_calls() {
 
 #[tokio::test]
 async fn long_prints_are_capped_and_the_traceback_kept() {
-    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], Limits::default()).unwrap();
     let snippet = "for i in range(300):\n    print('x' * 99)\nraise ValueError('end')";
     let (text, is_error) = run(&code, snippet).await;
     assert!(is_error);
@@ -692,7 +721,7 @@ async fn long_prints_are_capped_and_the_traceback_kept() {
 #[tokio::test]
 async fn help_lists_signature_and_examples() {
     let pack = packs::reports();
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let (text, _) = run(&code, "help('count_by')").await;
     assert!(
         text.starts_with("=> 'def count_by(rows: list[dict], key: str) -> list[dict]\\n"),
@@ -740,7 +769,7 @@ async fn sandbox_timeout_discards_the_session() {
         max_feed_duration: Duration::from_millis(200),
         ..Limits::default()
     };
-    let code = CodeMode::new(test_pool().await, vec![], limits).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], limits).unwrap();
     assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
     let (text, is_error) = run(&code, "while True:\n    pass").await;
     assert!(is_error);
@@ -753,7 +782,7 @@ async fn sandbox_timeout_discards_the_session() {
 #[tokio::test]
 async fn python_call_timeout_discards_the_session() {
     let pack = Pack::new("fakes", "fakes").with_host(slow());
-    let mut code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let mut code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     code.call_timeout = Duration::from_millis(300);
     assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
     let (text, is_error) = run(&code, "await slow()").await;
@@ -768,7 +797,7 @@ async fn python_call_timeout_discards_the_session() {
 
 #[tokio::test]
 async fn suspension_limit_discards_the_session() {
-    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], Limits::default()).unwrap();
     assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
     // help() is free, but every call is a suspension; the pool allows 1,000 per session.
     let (text, is_error) = run(&code, "for i in range(1100):\n    help('x')").await;
@@ -783,7 +812,7 @@ async fn suspension_limit_discards_the_session() {
 async fn bad_args_in_a_gather_are_refunded_and_the_rest_run() {
     let calls = Arc::new(AtomicUsize::new(0));
     let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let snippet = "await asyncio.gather(search(query='a'), search(query='b', limt=1), \
                    search(query='c'))";
     let (text, is_error) = run(&code, snippet).await;
@@ -801,9 +830,9 @@ async fn first_fatal_error_drops_the_rest_of_its_gather() {
     let pack = Pack::new("fakes", "fakes")
         .with_host(slow())
         .with_host(host("boom", |_| {
-            Err(HostError::Fatal(Error::authentication("rejected key")))
+            Err(HostError::Fatal(Error::tool("rejected key", None)))
         }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let tool_use = ToolUseBlock::new(
         "toolu_1",
         TOOL_NAME,
@@ -811,7 +840,7 @@ async fn first_fatal_error_drops_the_rest_of_its_gather() {
     );
     let started = Instant::now();
     let error = code.call(&tool_use).await.unwrap_err();
-    assert!(error.is_authentication(), "{error}");
+    assert_eq!(error.kind(), &ErrorKind::Tool, "{error}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -826,15 +855,15 @@ async fn cancel_notice_survives_a_full_pool() {
     config.max_processes = 1;
     config.checkout_timeout = Some(Duration::from_millis(200));
     let full = Arc::new(Pool::new(config).await.unwrap());
-    let holder = CodeMode::new(full.clone(), vec![], Limits::default()).unwrap();
+    let holder = CodeMode::try_new(full.clone(), vec![], Limits::default()).unwrap();
     assert_eq!(run(&holder, "1").await, ("=> 1".to_string(), false));
 
     // A session left mid-turn by a cancelled call, on a worker from another pool.
-    let other = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let other = CodeMode::try_new(test_pool().await, vec![], Limits::default()).unwrap();
     assert_eq!(run(&other, "1").await, ("=> 1".to_string(), false));
     let mut stale = other.session.lock().await.take().unwrap();
     stale.mid_turn = true;
-    let code = CodeMode::new(full, vec![], Limits::default()).unwrap();
+    let code = CodeMode::try_new(full, vec![], Limits::default()).unwrap();
     *code.session.lock().await = Some(stale);
 
     assert_eq!(
@@ -853,10 +882,13 @@ async fn limits_past_the_python_call_timeout_are_rejected() {
         max_turn_duration: Duration::from_secs(200),
         ..Limits::default()
     };
-    let error = CodeMode::new(test_pool().await, vec![], limits)
+    let error = CodeMode::try_new(test_pool().await, vec![], limits)
         .err()
         .unwrap();
-    assert!(error.is_validation(), "{error}");
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
 }
 
 // A list holding one list twice, 30 deep: tiny in the sandbox, 2^30 items expanded.
@@ -870,7 +902,7 @@ async fn shared_references_stay_bounded() {
         counter.fetch_add(1, Ordering::SeqCst);
         Ok(args)
     }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let started = Instant::now();
 
     let (text, is_error) = run(&code, &format!("{DOUBLING}await echo(a=x)")).await;
@@ -900,7 +932,7 @@ async fn item_and_depth_limits() {
     let pack = Pack::new("fakes", "fakes").with_host(host("size", |args| {
         Ok(json!(args["a"].as_array().map_or(0, Vec::len)))
     }));
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     assert_eq!(
         run(&code, "await size(a=list(range(100000)))").await,
         ("=> 100000".to_string(), false)
@@ -944,7 +976,7 @@ async fn firecrawl_pack_refuses_blocked_results_and_redirects() {
         FirecrawlFetchPage::new(firecrawl_client(&url)).with_blocked_domains(blocked),
         100,
     );
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     assert_eq!(
         run(&code, "[hit['url'] for hit in await search(query='x')]").await,
         ("=> ['https://example.com/a']".to_string(), false)
@@ -967,7 +999,7 @@ async fn search_with_scrape_sends_options_and_cuts_markdown() {
     }))])
     .await;
     let search = FirecrawlWebSearch::new(firecrawl_client(&url)).with_max_content_chars(5);
-    let code = CodeMode::new(
+    let code = CodeMode::try_new(
         test_pool().await,
         vec![firecrawl_pack(&url, search, 100)],
         Limits::default(),
@@ -988,19 +1020,22 @@ async fn search_with_scrape_sends_options_and_cuts_markdown() {
 #[tokio::test]
 async fn broken_pack_source_is_an_error() {
     let pack = Pack::new("broken", "broken").with_source("raise ValueError('bad pack')");
-    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "1"}));
     let error = code.call(&tool_use).await.unwrap_err();
-    assert!(matches!(error, Error::Sandbox { .. }), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Sandbox), "{error}");
+    let source = std::error::Error::source(&error).map(ToString::to_string);
     assert!(
-        error.to_string().contains("ValueError: bad pack"),
-        "{error}"
+        source
+            .as_deref()
+            .is_some_and(|source| source.contains("ValueError: bad pack")),
+        "{source:?}"
     );
 }
 
 #[tokio::test]
 async fn input_without_code_is_an_error_result() {
-    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let code = CodeMode::try_new(test_pool().await, vec![], Limits::default()).unwrap();
     for input in [
         json!({"cod": "1"}),
         json!({"code": 1}),
@@ -1017,9 +1052,9 @@ async fn input_without_code_is_an_error_result() {
 }
 
 #[tokio::test]
-async fn duplicate_packs_and_stray_examples_fail_in_new() {
+async fn duplicate_packs_and_stray_examples_fail_in_try_new() {
     let pool = test_pool().await;
-    let twice = CodeMode::new(
+    let twice = CodeMode::try_new(
         pool.clone(),
         vec![packs::reports(), Pack::new("reports", "again")],
         Limits::default(),
@@ -1036,7 +1071,7 @@ async fn duplicate_packs_and_stray_examples_fail_in_new() {
         code: "1",
         expect: "=> 1",
     };
-    let stray = CodeMode::new(
+    let stray = CodeMode::try_new(
         pool,
         vec![Pack::new("a", "a").with_example("nope", example)],
         Limits::default(),
@@ -1048,4 +1083,41 @@ async fn duplicate_packs_and_stray_examples_fail_in_new() {
             .to_string()
             .contains("pack a has an example for nope, which it does not define")
     );
+}
+
+#[tokio::test]
+async fn fatal_host_error_surfaces_unchanged() {
+    #[derive(Debug)]
+    struct Cause;
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the tool's own cause")
+        }
+    }
+    impl std::error::Error for Cause {}
+
+    let original = Error::tool("rejected key", Some(Box::new(Cause)));
+    let fatal = original.clone();
+    let pack = Pack::new("fakes", "fakes")
+        .with_host(host("boom", move |_| Err(HostError::Fatal(fatal.clone()))));
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "await boom()"}));
+    let error = code.call(&tool_use).await.unwrap_err();
+    // Not wrapped: same kind, same words, and the tool author's error is still the source.
+    assert_eq!(error.kind(), &ErrorKind::Tool);
+    assert_eq!(error.to_string(), original.to_string());
+    let source = std::error::Error::source(&error).expect("the tool's error is the source");
+    assert_eq!(source.to_string(), "the tool's own cause");
+    assert!(std::error::Error::source(source).is_none());
+}
+
+#[tokio::test]
+async fn pool_start_failure_keeps_the_pool_error_as_source() {
+    let Err(error) = pool("/nonexistent/monty-binary", 1).await else {
+        panic!("a missing binary should fail the pool");
+    };
+    assert!(matches!(error.kind(), ErrorKind::Sandbox), "{error}");
+    assert_eq!(error.to_string(), "could not start the sandbox pool");
+    let source = std::error::Error::source(&error).expect("the pool error is the source");
+    assert!(!source.to_string().is_empty());
 }

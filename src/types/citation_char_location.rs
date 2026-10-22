@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// This type is used to indicate a specific span of text in a document by
 /// character indices.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CitationCharLocation {
     /// The text that was cited
     pub cited_text: String,
@@ -29,15 +30,16 @@ pub struct CitationCharLocation {
 
 impl CitationCharLocation {
     /// Creates a new CitationCharLocation
+    #[must_use]
     pub fn new(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_char_index: i32,
         end_char_index: i32,
         document_title: Option<String>,
     ) -> Self {
         Self {
-            cited_text,
+            cited_text: cited_text.into(),
             document_index,
             document_title,
             end_char_index,
@@ -47,14 +49,10 @@ impl CitationCharLocation {
     }
 
     /// Sets the ID of the cited file
+    #[must_use]
     pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
         self.file_id = Some(file_id.into());
         self
-    }
-
-    /// Returns the length of the cited text in characters
-    pub fn length(&self) -> i32 {
-        self.end_char_index - self.start_char_index
     }
 }
 
@@ -106,19 +104,5 @@ mod tests {
         assert_eq!(location.document_title, Some("Document Title".to_string()));
         assert_eq!(location.end_char_index, 12);
         assert_eq!(location.start_char_index, 0);
-    }
-
-    #[test]
-    fn length() {
-        let location = CitationCharLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_char_index: 12,
-            start_char_index: 0,
-            file_id: None,
-        };
-
-        assert_eq!(location.length(), 12);
     }
 }

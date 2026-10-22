@@ -1,41 +1,43 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::CacheTtl;
+use crate::types::wire_tag::EphemeralTag;
 
-/// CacheControlEphemeral specifies that content should be ephemeral, meaning it should
-/// not be cached or persisted beyond the immediate request.
+/// Marks a prompt-cache breakpoint: the API caches the prompt prefix up to and
+/// including the block that carries it.
 ///
-/// This is useful for sensitive information that shouldn't be stored long-term.
+/// The cache entry lives five minutes unless `ttl` is set. "Ephemeral" is the API's
+/// name for this cache type; it does not mean "do not cache".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CacheControlEphemeral {
-    /// The type is always "ephemeral" for this struct
-    #[serde(default = "default_type")]
-    pub r#type: String,
+    /// Cache type, always `"ephemeral"`.
+    #[serde(default)]
+    r#type: EphemeralTag,
 
     /// How long the cache breakpoint lives. Omitted means five minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<CacheTtl>,
 }
 
-fn default_type() -> String {
-    "ephemeral".to_string()
-}
-
 impl CacheControlEphemeral {
-    /// Creates a new CacheControlEphemeral instance
+    /// Creates a breakpoint with the default five-minute lifetime.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            r#type: default_type(),
+            r#type: EphemeralTag,
             ttl: None,
         }
     }
 
     /// Creates a cache control with a one-hour lifetime.
+    #[must_use]
     pub fn one_hour() -> Self {
         Self::new().with_ttl(CacheTtl::OneHour)
     }
 
     /// Sets the cache lifetime.
+    #[must_use]
     pub fn with_ttl(mut self, ttl: CacheTtl) -> Self {
         self.ttl = Some(ttl);
         self
@@ -67,7 +69,7 @@ mod tests {
         let json = serde_json::json!({"type": "ephemeral"});
         let cache_control: CacheControlEphemeral = serde_json::from_value(json).unwrap();
 
-        assert_eq!(cache_control.r#type, "ephemeral");
+        assert_eq!(cache_control.r#type, EphemeralTag);
         assert_eq!(cache_control.ttl, None);
     }
 

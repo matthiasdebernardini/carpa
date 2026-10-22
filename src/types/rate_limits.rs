@@ -4,8 +4,11 @@ use reqwest::header::HeaderMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 
+use crate::http::header_str;
+
 /// One rate-limit window reported by `anthropic-ratelimit-*` response headers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RateLimitWindow {
     /// The maximum value permitted in the window.
     pub limit: u64,
@@ -17,6 +20,7 @@ pub struct RateLimitWindow {
 
 /// Rate-limit state read from the headers of one API response.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RateLimits {
     /// Requests window.
     pub requests: Option<RateLimitWindow>,
@@ -40,10 +44,6 @@ pub struct RateLimits {
     pub workspace_id: Option<String>,
     /// The request identifier (`request-id`).
     pub request_id: Option<String>,
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn window(headers: &HeaderMap, prefix: &str) -> Option<RateLimitWindow> {
@@ -87,6 +87,7 @@ impl RateLimits {
     ///
     /// A window is `Some` only when both its `-limit` and `-remaining` headers parse.
     /// Malformed values are ignored.
+    #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
         Self {
             requests: window(headers, "anthropic-ratelimit-requests"),
