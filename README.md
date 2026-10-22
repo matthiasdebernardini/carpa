@@ -11,7 +11,8 @@ What it covers:
 - web search and page fetch through [Firecrawl](https://firecrawl.dev);
 - Jev, TypeSafe's decision model, for yes/no, pick-one and rating answers;
 - code mode, where Claude writes one Python script that calls those tools many times;
-- prompt caching, Message Batches, files, per-response cost, rate limits and tracing.
+- prompt caching, Message Batches, files, per-response cost, rate limits and tracing;
+- an embedded SurrealDB, optional, for memory, transcripts, a Firecrawl cache, a usage ledger and read-only queries.
 
 Topcoat SI is a fork of Robert Escriva's [claudius](https://github.com/rescrv/claudius) crate (Apache-2.0), trimmed to the Messages API client.
 
@@ -29,6 +30,7 @@ Topcoat SI is a fork of Robert Escriva's [claudius](https://github.com/rescrv/cl
 - [Usage and cost](#usage-and-cost)
 - [Monitoring](#monitoring)
 - [Files](#files)
+- [SurrealDB](#surrealdb): memory, transcripts, Firecrawl cache, usage ledger, the `surreal` pack
 - [Errors and retries](#errors-and-retries)
 - [Testing your code](#testing-your-code)
 - [Examples](#examples)
@@ -47,6 +49,7 @@ TLS always goes through rustls.
 | Feature | What it does |
 |---|---|
 | `code-mode` | Adds [code mode](#code-mode). Off by default. |
+| `surreal` | Adds [SurrealDB](#surrealdb), an embedded database. Off by default. |
 
 ## A first request
 
@@ -612,6 +615,7 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `research` | `search_and_rank`, `scrape_many`, `dedupe_urls` | `firecrawl`, `jev` |
 | `triage` | `classify_all`, `score_all`, `group_by` | `jev` |
 | `reports` | `table`, `to_csv`, `count_by` | |
+| `surreal` | `query`, `tables`, `describe`, `rows`, `one`, `count` | the `surreal` feature |
 
 `packs::firecrawl` takes your two Firecrawl tools and a credit budget. Their domain lists, result cap, scrape options and content cut apply exactly as in the tool loop. The budget, `max_credits`, covers the whole conversation; once it is used up, both functions raise `RuntimeError`.
 
@@ -962,6 +966,91 @@ async fn summarise(client: &Anthropic, text: &str) -> topcoat_si::Result<()> {
     Ok(())
 }
 ```
+
+## SurrealDB
+
+The `surreal` feature adds an embedded database for the things a stateless client cannot keep: Claude's memory, transcripts and batch ids that outlive a restart, a cache of Firecrawl answers, a usage ledger, and a read-only query tool over your own data. The engine is [SurrealDB](https://surrealdb.com) 3.2 on SurrealKV, pure Rust, one directory, no server.
+
+```toml
+[dependencies.topcoat-si]
+git = "https://github.com/matthiasdebernardini/topcoat-si"
+features = ["surreal"]
+```
+
+The crate is re-exported as `topcoat_si::surrealdb`, so your app needs no dependency of its own. For your own tables, derive records with `#[derive(SurrealValue)] #[surreal(crate = "topcoat_si::surrealdb::types")]`, or read rows as `serde_json::Value`.
+
+`surreal::open` opens or creates the database and selects a namespace and database. Every store below takes that handle and defines its own tables when built, with `IF NOT EXISTS`, so opening twice changes nothing. All of its tables start with `topcoat_`, so they never collide with yours.
+
+```rust,no_run
+#[cfg(feature = "surreal")]
+async fn stores() -> topcoat_si::Result<()> {
+    use topcoat_si::surreal::{self, Memory, Transcripts, UsageLedger};
+
+    let db = surreal::open("data/app.surreal", "myapp", "app").await?;
+    let memory = Memory::try_new(db.clone(), "user-42").await?;
+    let transcripts = Transcripts::try_new(db.clone()).await?;
+    let ledger = UsageLedger::try_new(db).await?;
+    let _ = (memory, transcripts, ledger);
+    Ok(())
+}
+```
+
+Two rules come from SurrealKV:
+
+- **One process per directory.** The engine holds an exclusive lock, so a web server and a worker binary need two paths, and a deploy stops the old process before the new one starts.
+- **Open once, clone the handle.** `Surreal` is cheap to clone; opening the same path twice in one process fails.
+
+### Memory
+
+`Memory` is a `ClientTool` for Claude's memory tool (`memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete` and `rename` over paths under `/memories`, stored as rows. The `scope` you pass isolates one user or conversation: never share a scope between users, or one user's notes reach another's Claude.
+
+`memory.search_tool()` is a second tool, `memory_search`, that ranks memory files by relevance with BM25 full-text search; `Memory::search` does the same from Rust. Put both in the same `run_tools` call.
+
+### Transcripts and batches
+
+`Transcripts` saves a `ToolRun` or a `ToolRunError` under an id you choose and loads it back, messages and responses intact, so a run can be resumed after a restart the way [the tool loop](#the-tool-loop) resumes from `failed.messages`. `watch(id)` is a live query: a stream that yields the transcript after every save and ends when it is deleted.
+
+`Batches` keeps Message Batch ids with a label and the last status seen. After a restart, `pending()` lists the batches that had not ended, oldest first, ready for `wait_for_message_batch`.
+
+### Firecrawl cache
+
+`FirecrawlClient::with_cache` takes anything implementing `FirecrawlCache` and a time to live. An identical search or scrape within that time is answered from the cache and costs no credits; failures are never cached (a page that answered with an error status, such as 404 or 503, counts as one), a scrape with `max_age` of zero skips the cache lookup, and a cache error only costs a repeat call. `PageCache` is the SurrealDB implementation. It also indexes the cached markdown, so `PageCache::search` finds pages Claude has already fetched, and `purge_expired` drops stale rows.
+
+```rust,no_run
+#[cfg(feature = "surreal")]
+async fn cached(db: topcoat_si::surrealdb::Surreal<topcoat_si::surrealdb::engine::local::Db>) -> topcoat_si::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use topcoat_si::FirecrawlClient;
+    use topcoat_si::surreal::PageCache;
+
+    let cache = Arc::new(PageCache::try_new(db).await?);
+    let firecrawl = FirecrawlClient::from_env()?.with_cache(cache, Duration::from_secs(3600));
+    let _ = firecrawl;
+    Ok(())
+}
+```
+
+### Usage ledger
+
+`UsageLedger::record` stores one row per response: model, tokens, cache reads and writes, and the cost from `KnownModel::cost_micro_cents` (0 for a custom model). `record_run` stores every response of a `ToolRun`. `totals(since)` sums them per model. It is the durable form of the `topcoat_si::usage` tracing event in [Monitoring](#monitoring).
+
+### The `surreal` pack
+
+With both `code-mode` and `surreal` on, `let reader = Reader::try_new(db.clone(), "myapp", "app").await?;` and then `code_mode::packs::surreal(&reader, 200)` let Claude read your database from Python. `Reader` (from `topcoat_si::surreal`) takes the handle, its namespace and database; `200` is `max_rows`. One reader per app, like one pool: build it once and share it across conversations, since building it sets a new secret and concurrent builds would race. It holds a session that never expires.
+
+| Function | Does |
+|---|---|
+| `query(surql, params)` | runs SurrealQL with `$name` bound from `params`; the last statement's rows, at most `max_rows` |
+| `tables()` | the tables open to the pack |
+| `describe(table)` | the fields and indexes of one table |
+| `rows`, `one`, `count` | Python helpers over `query` |
+
+The pack signs in as a record user on a session of its own, so SurrealDB's permission system, not this crate, decides what Claude can read. A table is visible only if its definition grants `select` to record users, for example `DEFINE TABLE orders ... PERMISSIONS FOR select FULL;`, or `FOR select WHERE season = 2026` to show some rows. Everything else does not exist for the pack, including this crate's own tables and other users' memory, and `tables()` lists only what is open. Record users cannot define, remove or alter anything, and cannot write unless a table grants it, which yours should not. Even where a table does grant writes, every call runs in a transaction that is always cancelled, so nothing a query writes stays. Network functions are off because `surreal::open` keeps SurrealDB's default capabilities; an app that opens the database with network access allowed gives it to the pack too. A call returns after 20 seconds, but the local engine cannot cancel a query, so a slow one may run to completion in the engine. Query errors come back to Claude as Python exceptions with SurrealDB's message, so it can fix the query.
+
+Three things a record user can still do, checked on 3.2.6: advance a `DEFINE SEQUENCE` with `sequence::nextval`, so a database open to the pack should not hand out ids from sequences; call `sleep()`, bounded only by the 20 second timeout; and start a `LIVE SELECT`, which lasts only as long as that call's session, since every call runs on a clone of the reader. None of them reads or changes your rows.
+
+The evals binary can also keep its results in SurrealDB; see [evals/README.md](evals/README.md).
 
 ## Errors and retries
 

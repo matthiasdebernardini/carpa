@@ -7,10 +7,14 @@ mod firecrawl;
 mod jev;
 mod reports;
 mod research;
+#[cfg(feature = "surreal")]
+mod surreal;
 mod triage;
 
 pub use firecrawl::firecrawl;
 pub use jev::jev;
 pub use reports::reports;
 pub use research::research;
+#[cfg(feature = "surreal")]
+pub use surreal::surreal;
 pub use triage::triage;
