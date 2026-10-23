@@ -15,7 +15,7 @@ use super::tool::{CANCELLED, RESTARTED, TOOL_NAME, definition};
 use super::*;
 use crate::client_tool::ClientTool;
 use crate::error::{Error, ErrorKind};
-use crate::firecrawl::FirecrawlClient;
+use crate::firecrawl::{FirecrawlClient, ScrapeOptions};
 use crate::jev::JevClient;
 use crate::test_support::{Canned, read_request, serve};
 use crate::types::{KnownModel, MessageCreateParams, MessageParam, Model, ToolResultBlockContent};
@@ -179,11 +179,16 @@ impl Drop for PausedClock {
 /// A `nap` host function sleeping `secs` on a paused clock: the call timeouts see the full
 /// sleep, the test does not wait for it.
 fn nap(secs: u64) -> impl HostFunction {
-    host_fn("nap", "nap() -> None", "sleeps", move |_: Value| async move {
-        let _clock = PausedClock::new();
-        tokio::time::sleep(Duration::from_secs(secs)).await;
-        Ok(Value::Null)
-    })
+    host_fn(
+        "nap",
+        "nap() -> None",
+        "sleeps",
+        move |_: Value| async move {
+            let _clock = PausedClock::new();
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            Ok(Value::Null)
+        },
+    )
 }
 
 fn firecrawl_pack(url: &str, search: FirecrawlWebSearch, max_credits: u32) -> Pack {
@@ -1197,7 +1202,10 @@ async fn host_call_timeout_is_configurable() {
         ..Limits::default()
     };
     let code = CodeMode::try_new(pool.clone(), vec![pack()], limits).unwrap();
-    assert_eq!(run(&code, "await nap()").await, ("=> None".to_string(), false));
+    assert_eq!(
+        run(&code, "await nap()").await,
+        ("=> None".to_string(), false)
+    );
 
     let code = CodeMode::try_new(pool, vec![pack()], Limits::default()).unwrap();
     let (text, is_error) = run(&code, "await nap()").await;
@@ -1548,4 +1556,669 @@ async fn pool_start_failure_keeps_the_pool_error_as_source() {
     assert_eq!(error.to_string(), "could not start the sandbox pool");
     let source = std::error::Error::source(&error).expect("the pool error is the source");
     assert!(!source.to_string().is_empty());
+}
+
+// The FirecrawlPack: search, scrape, gov search and map with caps, credits and an observer.
+
+fn scrape_ok(url: &str, metadata: Value) -> Canned {
+    let mut metadata = metadata;
+    metadata["url"] = json!(url);
+    metadata["statusCode"] = json!(200);
+    ok(json!({"success": true, "data": {"markdown": "# Page", "metadata": metadata}}))
+}
+
+fn gov_response() -> Canned {
+    ok(json!({
+        "success": true,
+        "data": {"web": [{
+            "url": "https://law.example.gov/zoning", "title": "Zoning", "description": "variances",
+            "position": 1
+        }]}
+    }))
+}
+
+fn map_response() -> Canned {
+    ok(json!({
+        "success": true,
+        "links": [
+            {"url": "https://example.gov/agendas", "title": "Agendas"},
+            {"url": "https://example.gov/minutes"}
+        ]
+    }))
+}
+
+#[derive(Default)]
+struct FirecrawlEvents(Mutex<Vec<packs::FirecrawlEvent>>);
+
+impl packs::FirecrawlObserver for FirecrawlEvents {
+    fn event(&self, event: packs::FirecrawlEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[tokio::test]
+async fn firecrawl_pack_builder_examples_pass() {
+    let (url, _) = serve(vec![
+        search_response(),
+        ok(json!({
+            "success": true,
+            "data": {"markdown": "Item 1<!-- page 2 -->Item 2", "metadata": {
+                "url": "https://example.com/agenda.pdf", "statusCode": 200, "numPages": 2
+            }}
+        })),
+        gov_response(),
+        map_response(),
+    ])
+    .await;
+    testing::check_pack(
+        test_pool().await,
+        || packs::FirecrawlPack::new(firecrawl_client(&url)).build(),
+        Vec::new,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn firecrawl_pack_caps_refuse_without_sending() {
+    let (url, recorded) = serve(vec![search_response(), gov_response()]).await;
+    let budget = Arc::new(
+        packs::FirecrawlBudget::new()
+            .with_max_searches(1)
+            .with_max_scrapes(0)
+            .with_max_maps(0)
+            .with_max_gov_searches(0),
+    );
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, "len(await search(query='x'))").await,
+        ("=> 2".to_string(), false)
+    );
+    for (snippet, refused) in [
+        ("await search(query='y')", "search budget of 1"),
+        (
+            "await scrape(url='https://example.com/a')",
+            "scrape budget of 0",
+        ),
+        (
+            "await map_site(url='https://example.com')",
+            "map budget of 0",
+        ),
+        ("await gov_search(query='q')", "gov search budget of 0"),
+    ] {
+        let (text, is_error) = run(&code, snippet).await;
+        let expected =
+            format!("RuntimeError: Firecrawl {refused} used up; finish with what you have");
+        assert!(is_error && text.contains(&expected), "{snippet}: {text}");
+    }
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    let used = budget.used();
+    assert_eq!(
+        (used.searches, used.scrapes, used.maps, used.gov_searches),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(used.credits, 2);
+    code.finish().await.unwrap();
+
+    // Once the credits are used up, only the free gov search still goes out.
+    let budget = Arc::new(
+        packs::FirecrawlBudget::new()
+            .with_max_credits(2)
+            .with_used(used),
+    );
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/a')").await;
+    assert!(is_error);
+    assert!(
+        text.contains(
+            "RuntimeError: Firecrawl credit budget of 2 used up; finish with what you have"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        run(&code, "len(await gov_search(query='q'))").await,
+        ("=> 1".to_string(), false)
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!(budget.used().credits, 2);
+    assert_eq!(budget.used().gov_searches, 1);
+}
+
+#[tokio::test]
+async fn firecrawl_pack_charges_scrape_credits_and_sends_pdf_options() {
+    let (url, recorded) = serve(vec![
+        ok(json!({
+            "success": true,
+            "data": {
+                "markdown": "abcdefghij",
+                "links": ["https://example.com/next"],
+                "metadata": {
+                    "url": "https://example.com/a.pdf", "statusCode": 200, "numPages": 20,
+                    "totalPages": 40
+                }
+            }
+        })),
+        scrape_ok("https://example.com/b", json!({"creditsUsed": 7})),
+    ])
+    .await;
+    let budget = Arc::new(packs::FirecrawlBudget::new().with_max_credits(100));
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .with_max_pdf_pages(20)
+        .with_content_chars(4)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "p = await scrape(url=' https://example.com/a.pdf', pdf_mode='fast', \
+                   links=True)\n(p['url'], p['requested_url'], p['markdown'], p['chars'], \
+                   p['truncated'], p['clamped_to'], p['num_pages'], p['total_pages'], \
+                   p['links'], p['pages'], p['credits'])";
+    assert_eq!(
+        run(&code, snippet).await,
+        (
+            "=> ('https://example.com/a.pdf', 'https://example.com/a.pdf', 'abcd [truncated]', \
+             10, True, 20, 20, 40, ['https://example.com/next'], None, 20)"
+                .to_string(),
+            false
+        )
+    );
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["formats"], json!(["markdown", "links"]), "{body}");
+    assert_eq!(
+        body["parsers"][0],
+        json!({"type": "pdf", "mode": "fast", "maxPages": 20, "pageMarkers": true}),
+        "{body}"
+    );
+    assert_eq!(budget.used().credits, 20);
+
+    // Firecrawl's own figure wins.
+    assert_eq!(
+        run(
+            &code,
+            "(await scrape(url='https://example.com/b', max_pages=5))['credits']"
+        )
+        .await,
+        ("=> 7".to_string(), false)
+    );
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[1].body).unwrap();
+    assert_eq!(body["parsers"][0]["maxPages"], 5, "{body}");
+    assert_eq!(body["formats"], json!(["markdown"]), "{body}");
+    assert_eq!(budget.used().credits, 27);
+    assert_eq!(budget.used().scrapes, 2);
+}
+
+#[tokio::test]
+async fn firecrawl_budget_with_used_restores_counts() {
+    let saved = packs::FirecrawlUsed {
+        searches: 3,
+        scrapes: 2,
+        maps: 1,
+        gov_searches: 4,
+        credits: 9,
+    };
+    let round_trip: packs::FirecrawlUsed =
+        serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    assert_eq!(round_trip, saved);
+    let budget = Arc::new(
+        packs::FirecrawlBudget::new()
+            .with_max_scrapes(2)
+            .with_used(round_trip),
+    );
+    assert_eq!(budget.used(), saved);
+    let (url, recorded) = serve(Vec::new()).await;
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/a')").await;
+    assert!(
+        is_error && text.contains("scrape budget of 2 used up"),
+        "{text}"
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+    assert_eq!(budget.used(), saved);
+}
+
+#[tokio::test]
+async fn firecrawl_observer_sees_every_event_in_order() {
+    let (url, _) = serve(vec![
+        search_response(),
+        scrape_ok("https://example.com/landed", json!({})),
+        gov_response(),
+        map_response(),
+        Canned::json(500, json!({"success": false, "error": "down"}).to_string()),
+    ])
+    .await;
+    let budget = Arc::new(packs::FirecrawlBudget::new().with_max_maps(1));
+    let events = Arc::new(FirecrawlEvents::default());
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert!(!run(&code, "await search(query='x')").await.1);
+    // An invalid call sends nothing and costs nothing.
+    let (text, is_error) = run(&code, "await scrape(url='not a url')").await;
+    assert!(
+        is_error && text.contains("RuntimeError: Could not fetch not a url"),
+        "{text}"
+    );
+    assert_eq!(budget.used().scrapes, 0);
+    assert!(
+        !run(&code, "await scrape(url='https://example.com/a')")
+            .await
+            .1
+    );
+    assert!(!run(&code, "await gov_search(query='zoning')").await.1);
+    assert!(
+        !run(&code, "await map_site(url='https://example.gov')")
+            .await
+            .1
+    );
+    assert!(
+        run(&code, "await map_site(url='https://example.gov')")
+            .await
+            .1
+    );
+    // A sent request that fails gives Failed after its pre-send event.
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/down')").await;
+    assert!(
+        is_error && text.contains("RuntimeError: Could not fetch"),
+        "{text}"
+    );
+
+    use packs::FirecrawlEvent as E;
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 12, "{events:?}");
+    assert!(matches!(&events[0], E::Searching { function: "search", query } if query == "x"));
+    let E::Searched {
+        function: "search",
+        hits,
+        credits: 2,
+        ..
+    } = &events[1]
+    else {
+        panic!("expected Searched, got {:?}", events[1]);
+    };
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].url, "https://example.com/a");
+    assert!(matches!(
+        &events[2],
+        E::Failed { function: "scrape", arg, message }
+            if arg == "not a url" && message.starts_with("Could not fetch not a url")
+    ));
+    assert!(
+        matches!(&events[3], E::Scraping { function: "scrape", url } if url == "https://example.com/a")
+    );
+    let E::Scraped {
+        function: "scrape",
+        requested,
+        page,
+        credits: 1,
+    } = &events[4]
+    else {
+        panic!("expected Scraped, got {:?}", events[4]);
+    };
+    assert_eq!(requested, "https://example.com/a");
+    assert_eq!(page.url, "https://example.com/landed");
+    assert_eq!(page.markdown.as_deref(), Some("# Page"));
+    assert!(
+        matches!(&events[5], E::Searching { function: "gov_search", query } if query == "zoning")
+    );
+    assert!(matches!(
+        &events[6],
+        E::GovSearched { function: "gov_search", hits, .. } if hits.len() == 1
+    ));
+    assert!(matches!(
+        &events[7],
+        E::Mapping {
+            function: "map_site",
+            ..
+        }
+    ));
+    assert!(matches!(
+        &events[8],
+        E::Mapped { function: "map_site", links, credits: 1, .. } if links.len() == 2
+    ));
+    assert!(matches!(
+        &events[9],
+        E::Refused { function: "map_site", reason } if reason.contains("map budget of 1")
+    ));
+    assert!(
+        matches!(&events[10], E::Scraping { function: "scrape", url } if url == "https://example.com/down")
+    );
+    assert!(matches!(
+        &events[11],
+        E::Failed { function: "scrape", arg, message }
+            if arg == "https://example.com/down" && message.contains("500")
+    ));
+}
+
+#[tokio::test]
+async fn firecrawl_out_of_credits_raises_or_ends_the_run() {
+    let no_credits = || {
+        Canned::json(
+            402,
+            json!({"success": false, "error": "no credits"}).to_string(),
+        )
+    };
+    let (url, _) = serve(vec![no_credits(), no_credits()]).await;
+    let budget = Arc::new(packs::FirecrawlBudget::new());
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .with_out_of_credits(packs::OutOfCredits::Raise)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/a')").await;
+    assert!(is_error);
+    assert!(
+        text.contains("RuntimeError: Could not fetch https://example.com/a:")
+            && text.contains("402"),
+        "{text}"
+    );
+    // The request was sent, so it counts, with its reservation.
+    assert_eq!((budget.used().scrapes, budget.used().credits), (1, 1));
+    code.finish().await.unwrap();
+
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url)).build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let tool_use = ToolUseBlock::new(
+        "toolu_1",
+        TOOL_NAME,
+        json!({"code": "await search(query='x')"}),
+    );
+    let error = code.call(&tool_use).await.unwrap_err();
+    assert_eq!(error.status(), Some(402));
+}
+
+/// Gathers `n` scrapes and returns how many succeeded and how many were refused for `reason`.
+fn gathered_scrapes(n: usize, reason: &str) -> String {
+    format!(
+        "async def one(i):\n    try:\n        await scrape(url='https://example.com/' + \
+         str(i))\n        return True\n    except RuntimeError as e:\n        return str(e)\n\
+         results = await asyncio.gather(*[one(i) for i in range({n})])\n(len([r for r in \
+         results if r is True]), len([r for r in results if isinstance(r, str) and '{reason}' \
+         in r]))"
+    )
+}
+
+#[tokio::test]
+async fn firecrawl_budget_holds_under_gather() {
+    let page = || scrape_ok("https://example.com/p", json!({}));
+    let (url, recorded) = serve(vec![page(), page(), page()]).await;
+    let budget = Arc::new(packs::FirecrawlBudget::new().with_max_scrapes(3));
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, &gathered_scrapes(8, "scrape budget of 3 used up")).await,
+        ("=> (3, 5)".to_string(), false)
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 3);
+    assert_eq!(budget.used().scrapes, 3);
+    code.finish().await.unwrap();
+
+    // The credit cap holds the same way.
+    let (url, recorded) = serve(vec![page(), page()]).await;
+    let budget = Arc::new(packs::FirecrawlBudget::new().with_max_credits(2));
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, &gathered_scrapes(6, "credit budget of 2 used up")).await,
+        ("=> (2, 4)".to_string(), false)
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!((budget.used().scrapes, budget.used().credits), (2, 2));
+}
+
+#[tokio::test]
+async fn firecrawl_pack_search_sends_recency_categories_and_country() {
+    let (url, recorded) = serve(vec![
+        ok(json!({
+            "success": true,
+            "data": [
+                {"url": "https://example.com/a", "title": "A", "description": "the passage",
+                 "position": 1},
+                {"url": "https://example.com/b", "title": "B", "position": 2},
+                {"url": "https://example.com/c", "title": "C", "position": 3}
+            ]
+        })),
+        search_response(),
+    ])
+    .await;
+    let budget = Arc::new(packs::FirecrawlBudget::new());
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "hits = await search(query='x', recency='week', sort_by_date=True, \
+                   categories=['gov'])\n(sorted(hits[0].keys()), hits[0]['description'], \
+                   hits[2]['position'])";
+    assert_eq!(
+        run(&code, snippet).await,
+        (
+            "=> (['description', 'position', 'title', 'url'], 'the passage', 3)".to_string(),
+            false
+        )
+    );
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["tbs"], "qdr:w,sbd:1", "{body}");
+    assert_eq!(body["categories"], json!(["gov"]), "{body}");
+    assert_eq!(body["country"], "US", "{body}");
+    assert_eq!(body["limit"], 8, "{body}");
+    // No creditsUsed: 2 per 10 results returned.
+    assert_eq!(budget.used().credits, 2);
+
+    let snippet = "len(await search(query='x', recency='2025-01-01..2025-06-30', country=None))";
+    assert_eq!(run(&code, snippet).await, ("=> 2".to_string(), false));
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[1].body).unwrap();
+    assert_eq!(
+        body["tbs"], "cdr:1,cd_min:01/01/2025,cd_max:06/30/2025",
+        "{body}"
+    );
+    assert!(body.get("country").is_none(), "{body}");
+
+    for (snippet, expected) in [
+        ("await search(query='x', recency='fortnight')", "TypeError"),
+        (
+            "await search(query='x', categories=['gov', 'pdf'])",
+            "RuntimeError",
+        ),
+        (
+            "await scrape(url='https://example.com/a', pdf_mode='slow')",
+            "TypeError",
+        ),
+    ] {
+        let (text, is_error) = run(&code, snippet).await;
+        assert!(is_error && text.contains(expected), "{snippet}: {text}");
+    }
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!(budget.used().searches, 2);
+}
+
+#[tokio::test]
+async fn firecrawl_pack_cuts_pages_together_and_reports_both_sizes() {
+    let pdf = |pages: &[&str]| {
+        let pages: Vec<Value> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, text)| json!({"pageNumber": i + 1, "markdown": text}))
+            .collect();
+        ok(json!({
+            "success": true,
+            "data": {"markdown": "short", "pages": pages, "metadata": {
+                "url": "https://example.com/a.pdf", "statusCode": 200
+            }}
+        }))
+    };
+    let (url, _) = serve(vec![
+        pdf(&["abc", "def"]),
+        pdf(&["abcdefgh", "ijklmnop"]),
+        pdf(&["abcdefghij", "klm", "nop"]),
+    ])
+    .await;
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_scrape_defaults(ScrapeOptions::new().with_pdf_pages(true))
+        .with_content_chars(10)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "p = await scrape(url='https://example.com/a.pdf')\n([(x['page'], x['markdown']) \
+                   for x in p['pages']], p['chars'], p['page_chars'], p['truncated'])";
+    // Every page fits.
+    assert_eq!(
+        run(&code, snippet).await,
+        (
+            "=> ([(1, 'abc'), (2, 'def')], 5, 6, False)".to_string(),
+            false
+        )
+    );
+    // The page that does not fit is cut.
+    assert_eq!(
+        run(&code, snippet).await,
+        (
+            "=> ([(1, 'abcdefgh'), (2, 'ij [truncated]')], 5, 16, True)".to_string(),
+            false
+        )
+    );
+    // Once nothing is left, the rest are dropped.
+    assert_eq!(
+        run(&code, snippet).await,
+        ("=> ([(1, 'abcdefghij')], 5, 16, True)".to_string(), false)
+    );
+}
+
+#[derive(Default)]
+struct MemoryCache(Mutex<std::collections::HashMap<String, String>>);
+
+impl crate::FirecrawlCache for MemoryCache {
+    fn get<'a>(&'a self, key: &'a str) -> futures::future::BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.0.lock().unwrap().get(key).cloned() })
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: String,
+        _ttl: Duration,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.lock().unwrap().insert(key.to_string(), body);
+        })
+    }
+}
+
+#[tokio::test]
+async fn firecrawl_cache_hits_refund_their_reservation() {
+    let (url, recorded) = serve(vec![
+        scrape_ok("https://example.com/a", json!({"creditsUsed": 0})),
+        map_response(),
+    ])
+    .await;
+    let budget = Arc::new(packs::FirecrawlBudget::new());
+    let client = firecrawl_client(&url)
+        .with_cache(Arc::new(MemoryCache::default()), Duration::from_secs(60));
+    let pack = packs::FirecrawlPack::new(client)
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    // A scrape reserves 1 and Firecrawl reports 0, so the counter goes back down.
+    assert_eq!(
+        run(
+            &code,
+            "(await scrape(url='https://example.com/a'))['credits']"
+        )
+        .await,
+        ("=> 0".to_string(), false)
+    );
+    assert_eq!((budget.used().scrapes, budget.used().credits), (1, 0));
+
+    // The first map costs 1; the same map again comes from the cache and costs 0.
+    let snippet = "len(await map_site(url='https://example.gov'))";
+    assert_eq!(run(&code, snippet).await, ("=> 2".to_string(), false));
+    assert_eq!(budget.used().credits, 1);
+    assert_eq!(run(&code, snippet).await, ("=> 2".to_string(), false));
+    assert_eq!((budget.used().maps, budget.used().credits), (2, 1));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn firecrawl_pack_keeps_the_domain_policy_for_gov_search_and_maps() {
+    let (url, recorded) = serve(vec![
+        ok(json!({
+            "success": true,
+            "data": {"web": [
+                {"url": "https://blocked.com/law", "position": 1},
+                {"url": "https://law.example.gov/zoning", "position": 2}
+            ]}
+        })),
+        ok(json!({
+            "success": true,
+            "links": [{"url": "https://example.gov/agendas"}, {"url": "https://blocked.com/x"}]
+        })),
+    ])
+    .await;
+    let blocked = vec!["blocked.com".to_string()];
+    let pack = packs::FirecrawlPack::from_tools(
+        FirecrawlWebSearch::new(firecrawl_client(&url)).with_blocked_domains(blocked.clone()),
+        FirecrawlFetchPage::new(firecrawl_client(&url)).with_blocked_domains(blocked),
+    )
+    .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(
+            &code,
+            "[h['url'] for h in await gov_search(query='zoning')]"
+        )
+        .await,
+        ("=> ['https://law.example.gov/zoning']".to_string(), false)
+    );
+    assert_eq!(
+        run(
+            &code,
+            "[l['url'] for l in await map_site(url='https://example.gov')]"
+        )
+        .await,
+        ("=> ['https://example.gov/agendas']".to_string(), false)
+    );
+    let (text, is_error) = run(&code, "await map_site(url='https://blocked.com')").await;
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("RuntimeError: Could not map https://blocked.com: this tool may not fetch"),
+        "{text}"
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn firecrawl_empty_search_still_costs_credits_and_bad_ranges_send_nothing() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {"web": []}}))]).await;
+    let budget = Arc::new(packs::FirecrawlBudget::new());
+    let pack = packs::FirecrawlPack::new(firecrawl_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, "len(await search(query='nothing'))").await,
+        ("=> 0".to_string(), false)
+    );
+    // No results and no creditsUsed still cost 2.
+    assert_eq!(budget.used().credits, 2);
+
+    let snippet = "await search(query='x', recency='2025-06-30..2025-01-01')";
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("RuntimeError: custom time range starts after it ends"),
+        "{text}"
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    assert_eq!((budget.used().searches, budget.used().credits), (1, 2));
 }
