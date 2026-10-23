@@ -1,6 +1,6 @@
 //! The search response.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ResultMetadata;
 
@@ -20,8 +20,8 @@ pub struct SearchResponse {
     /// Non-fatal problem Firecrawl reported, such as a partially failed scrape.
     #[serde(default)]
     pub warning: Option<String>,
-    /// Results grouped by source.
-    #[serde(default)]
+    /// Results grouped by source. A flat `data` array of results is read as web results.
+    #[serde(default, deserialize_with = "grouped_or_flat")]
     pub data: Option<SearchData>,
 }
 
@@ -50,7 +50,9 @@ pub struct WebResult {
     /// Page title.
     #[serde(default)]
     pub title: Option<String>,
-    /// Search engine snippet.
+    /// The passage from the page that best answers the query, or the site's own description
+    /// when the search was sent with
+    /// [`SearchRequest::with_highlights(false)`](super::SearchRequest::with_highlights).
     #[serde(default)]
     pub description: Option<String>,
     /// Rank within the results.
@@ -77,7 +79,9 @@ pub struct NewsResult {
     /// Article title.
     #[serde(default)]
     pub title: Option<String>,
-    /// Article snippet.
+    /// The passage from the article that best answers the query, or the site's own snippet
+    /// when the search was sent with
+    /// [`SearchRequest::with_highlights(false)`](super::SearchRequest::with_highlights).
     #[serde(default)]
     pub snippet: Option<String>,
     /// Publication date as reported by the search engine.
@@ -117,4 +121,26 @@ pub struct ImageResult {
     /// Rank within the results.
     #[serde(default)]
     pub position: Option<u32>,
+}
+
+/// The results as an object of arrays by source, or as one flat array of web results.
+fn grouped_or_flat<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SearchData>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        // Tried first: a struct also accepts an array, by position.
+        Flat(Vec<WebResult>),
+        Grouped(SearchData),
+    }
+    Ok(
+        Option::<Wire>::deserialize(deserializer)?.map(|wire| match wire {
+            Wire::Flat(web) => SearchData {
+                web: Some(web),
+                ..SearchData::default()
+            },
+            Wire::Grouped(data) => data,
+        }),
+    )
 }

@@ -112,6 +112,10 @@ pub struct SearchRequest {
     pub timeout: Option<Duration>,
     /// Drop invalid URLs from results instead of failing.
     pub ignore_invalid_urls: Option<bool>,
+    /// Put the passage that best answers the query in each web result's `description` and each
+    /// news result's `snippet`. Firecrawl defaults to true; false returns the sites' own
+    /// descriptions and snippets.
+    pub highlights: Option<bool>,
     /// Scrape each result's page.
     pub scrape_options: Option<ScrapeOptions>,
 }
@@ -133,6 +137,7 @@ impl SearchRequest {
             country: None,
             timeout: None,
             ignore_invalid_urls: None,
+            highlights: None,
             scrape_options: None,
         }
     }
@@ -214,6 +219,13 @@ impl SearchRequest {
         self
     }
 
+    /// Set whether descriptions and snippets are the passages that best answer the query.
+    #[must_use]
+    pub fn with_highlights(mut self, highlights: bool) -> Self {
+        self.highlights = Some(highlights);
+        self
+    }
+
     /// Scrape each result's page.
     #[must_use]
     pub fn with_scrape_options(mut self, scrape_options: ScrapeOptions) -> Self {
@@ -280,6 +292,7 @@ impl SearchRequest {
             country: self.country.as_deref(),
             timeout: self.timeout.map(millis),
             ignore_invalid_urls: self.ignore_invalid_urls,
+            highlights: self.highlights,
             scrape_options: self.scrape_options.as_ref().map(ScrapeOptions::wire),
         }
     }
@@ -309,6 +322,8 @@ pub(super) struct WireSearchRequest<'request> {
     timeout: Option<u64>,
     #[serde(rename = "ignoreInvalidURLs", skip_serializing_if = "Option::is_none")]
     ignore_invalid_urls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlights: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scrape_options: Option<WireScrapeOptions>,
 }
