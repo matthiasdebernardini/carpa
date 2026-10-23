@@ -514,6 +514,8 @@ A request is sent again when its error is retryable (see [Errors and retries](#e
 
 `JevTool::new(client)` gives Claude Jev as a `jev` client tool. One call sends one state with any number of questions and costs one Jev request.
 
+Its input is a list of `ToolQuestion`s. Apps that take questions in the same shape can turn them into `Questions` with `Questions::from_tool` and render a response as the tool does with `jev::answers`.
+
 Problems the model or a retry can fix, such as bad input, 429, 5xx or a timeout, come back as `is_error` results. A rejected key (401) and other configuration problems are returned as `Err`, which stops the tool loop.
 
 ## Code mode
@@ -545,6 +547,8 @@ The crate never locates or downloads the binary. Your app passes its path to `co
 ### One pool per app, one `CodeMode` per conversation
 
 The pool caps the live sandboxes across all conversations. A `CodeMode` is one sandbox session. Never share one between conversations: one user's variables would reach another user's Claude.
+
+An app that builds a new `CodeMode` every turn calls `with_fresh_sessions()` on it, so the tool description tells Claude that variables do not carry over to later turns. The definition is the same for the same packs, so the prompt cache holds from turn to turn.
 
 ```rust,no_run
 #[cfg(feature = "code-mode")]
@@ -618,6 +622,29 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `surreal` | `query`, `tables`, `describe`, `rows`, `one`, `count` | the `surreal` feature |
 
 `packs::firecrawl` takes your two Firecrawl tools and a credit budget. Their domain lists, result cap, scrape options and content cut apply exactly as in the tool loop. The budget, `max_credits`, covers the whole conversation; once it is used up, both functions raise `RuntimeError`.
+
+`packs::jev(client)` gives the four Jev functions with no limits. `JevPack` adds them:
+
+| Builder | Adds |
+|---|---|
+| `with_budget(Arc<JevBudget>)` | a cap on requests for the conversation; once reached, the functions raise `RuntimeError` and send nothing |
+| `with_max_concurrency(n)` | at most `n` requests in flight; further calls in a `gather` wait, and the wait counts against the host-call timeout |
+| `with_observer(Arc<dyn JevObserver>)` | a `JevEvent` per step, naming the function: `Asking`, then `Answered` (usage, request id, latency, attempts) or `Failed`; `Refused` when the budget is used up |
+
+A request that was sent counts against the budget whether or not it succeeds. Calls with invalid questions or state are refused before sending and not counted. `JevBudget::used()` returns a `JevUsed` snapshot to save with the conversation, and `JevBudget::new(max).with_used(saved)` restores it.
+
+```rust,no_run
+#[cfg(feature = "code-mode")]
+fn jev_pack(client: topcoat_si::jev::JevClient) -> topcoat_si::code_mode::Pack {
+    use std::sync::Arc;
+    use topcoat_si::code_mode::packs::{JevBudget, JevPack};
+
+    JevPack::new(client)
+        .with_budget(Arc::new(JevBudget::new(120)))
+        .with_max_concurrency(4)
+        .build()
+}
+```
 
 Packs that hold host functions keep per-conversation state, so build them for each `CodeMode`.
 
@@ -708,8 +735,12 @@ To test a pack, call `check_pack` from `code_mode::testing` with the pool, a fun
 | `max_turn_duration` | 60 s | run time between two host round trips |
 | `max_host_calls` | 50 | host calls for the whole conversation |
 | `max_output_chars` | 20,000 | characters in one tool result; at least 5,000, reserved for the value or traceback |
+| `host_call_timeout` | 45 s | time one host function call may take; past it the call raises `RuntimeError` |
+| `python_call_timeout` | 120 s | time one `python` call may take, host calls included; past it the session restarts. At least the shorter of `max_feed_duration` and `max_turn_duration` plus 5 s |
 
-Two time limits are fixed: one host call times out after 45 seconds, and one `python` call after 120 seconds. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
+That shorter limit, plus 5 s, must also stay within 120 seconds, the time the pool gives the sandbox for one round trip before killing the worker.
+
+Raise both timeouts when your host functions are slow, such as scrapes with long server-side timeouts. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
 
 ### Advice for apps
 

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use monty_pool::PoolConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 use super::pack::untyped;
 use super::tool::{CANCELLED, RESTARTED, TOOL_NAME, definition};
@@ -15,7 +17,7 @@ use crate::client_tool::ClientTool;
 use crate::error::{Error, ErrorKind};
 use crate::firecrawl::FirecrawlClient;
 use crate::jev::JevClient;
-use crate::test_support::{Canned, serve};
+use crate::test_support::{Canned, read_request, serve};
 use crate::types::{KnownModel, MessageCreateParams, MessageParam, Model, ToolResultBlockContent};
 use crate::types::{ToolResultBlock, ToolUnionParam, ToolUseBlock};
 use crate::{Anthropic, FirecrawlFetchPage, FirecrawlWebSearch};
@@ -154,6 +156,32 @@ fn firecrawl_client(url: &str) -> FirecrawlClient {
 fn slow() -> impl HostFunction {
     host_fn("slow", "slow() -> None", "sleeps", |_: Value| async {
         tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(Value::Null)
+    })
+}
+
+/// Pauses the test runtime's clock until dropped, so a sleep ends at once when nothing else runs.
+struct PausedClock;
+
+impl PausedClock {
+    fn new() -> Self {
+        tokio::time::pause();
+        Self
+    }
+}
+
+impl Drop for PausedClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
+/// A `nap` host function sleeping `secs` on a paused clock: the call timeouts see the full
+/// sleep, the test does not wait for it.
+fn nap(secs: u64) -> impl HostFunction {
+    host_fn("nap", "nap() -> None", "sleeps", move |_: Value| async move {
+        let _clock = PausedClock::new();
+        tokio::time::sleep(Duration::from_secs(secs)).await;
         Ok(Value::Null)
     })
 }
@@ -632,7 +660,7 @@ async fn values_cross_both_ways() {
     assert_eq!(run(&code, "{1, 2}").await, ("=> {1, 2}".to_string(), false));
 }
 
-// 7. Firecrawl policy.
+// 7. Firecrawl and Jev policy.
 
 #[tokio::test]
 async fn firecrawl_pack_keeps_the_tool_policy() {
@@ -694,6 +722,275 @@ async fn firecrawl_credit_budget_stops_calls() {
         ),
         "{text}"
     );
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+fn jev_client(url: &str) -> JevClient {
+    JevClient::try_new("ts-key", "jev-1.13.0")
+        .unwrap()
+        .with_base_url(url)
+        .unwrap()
+        .with_max_retries(0)
+}
+
+/// A yes answer to the shortcuts' one question, with usage and a request id.
+fn jev_yes() -> Canned {
+    ok(json!({
+        "model": "jev-1.13.0",
+        "answers": {"answer": {"type": "noul", "noul": 0.99}},
+        "usage": {"input_tokens": 12, "output_tokens": 3}
+    }))
+    .with_header("x-typesafe-request-id", "req_1")
+}
+
+#[tokio::test]
+async fn jev_request_budget_stops_calls() {
+    let (url, recorded) = serve(vec![jev_yes()]).await;
+    let budget = Arc::new(packs::JevBudget::new(1));
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let refused = "RuntimeError: Jev request budget of 1 used up; finish with what you have";
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(text.contains(refused), "{text}");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    assert_eq!(budget.used(), packs::JevUsed::new(1));
+    code.finish().await.unwrap();
+
+    // A restored budget is already used up, so nothing is sent.
+    let restored = Arc::new(packs::JevBudget::new(1).with_used(budget.used()));
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(restored)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(text.contains(refused), "{text}");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+/// Answers every request with [`jev_yes`] after 200 ms, recording the most requests in flight
+/// at once.
+async fn slow_jev() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let most = peak.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (in_flight, peak) = (in_flight.clone(), peak.clone());
+            tokio::spawn(async move {
+                read_request(&mut socket).await;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let body = json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"answer": {"type": "noul", "noul": 0.99}}
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    (format!("http://{address}"), most)
+}
+
+#[tokio::test]
+async fn jev_max_concurrency_bounds_requests_in_flight() {
+    let (url, peak) = slow_jev().await;
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_max_concurrency(2)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "len(await asyncio.gather(*[yes_no(state=str(i), question='q') for i in \
+                   range(5)]))";
+    assert_eq!(run(&code, snippet).await, ("=> 5".to_string(), false));
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Default)]
+struct JevEvents(Mutex<Vec<packs::JevEvent>>);
+
+impl packs::JevObserver for JevEvents {
+    fn event(&self, event: packs::JevEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[tokio::test]
+async fn jev_observer_sees_usage_and_request_id() {
+    let (url, _) = serve(vec![
+        jev_yes(),
+        Canned::json(400, json!({"detail": "bad state"}).to_string()),
+    ])
+    .await;
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(
+        is_error && text.contains("RuntimeError: Jev failed"),
+        "{text}"
+    );
+
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert!(matches!(
+        events[0],
+        packs::JevEvent::Asking {
+            function: "yes_no",
+            questions: 1
+        }
+    ));
+    let packs::JevEvent::Answered {
+        function: "yes_no",
+        usage,
+        request_id,
+        attempts,
+        ..
+    } = &events[1]
+    else {
+        panic!("expected Answered, got {:?}", events[1]);
+    };
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(12), Some(3))
+    );
+    assert_eq!(request_id.as_deref(), Some("req_1"));
+    assert_eq!(*attempts, 1);
+    assert!(matches!(
+        events[2],
+        packs::JevEvent::Asking {
+            function: "yes_no",
+            questions: 1
+        }
+    ));
+    let packs::JevEvent::Failed {
+        function: "yes_no",
+        error,
+    } = &events[3]
+    else {
+        panic!("expected Failed, got {:?}", events[3]);
+    };
+    assert_eq!(error.status(), Some(400));
+}
+
+#[tokio::test]
+async fn jev_observer_sees_retried_attempts() {
+    let (url, _) = serve(vec![
+        Canned::json(500, json!({"detail": "busy"}).to_string()),
+        jev_yes(),
+    ])
+    .await;
+    let events = Arc::new(JevEvents::default());
+    let client = jev_client(&url).with_max_retries(1);
+    let pack = packs::JevPack::new(client)
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        matches!(events[1], packs::JevEvent::Answered { attempts: 2, .. }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn jev_budget_holds_under_gather() {
+    let (url, recorded) = serve(vec![jev_yes(), jev_yes()]).await;
+    let budget = Arc::new(packs::JevBudget::new(2));
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "async def one(i):\n    try:\n        return (await yes_no(state=str(i), \
+                   question='q'))['answer']\n    except RuntimeError as e:\n        return \
+                   str(e)\nresults = await asyncio.gather(*[one(i) for i in range(5)])\n\
+                   (len([r for r in results if r is True]), len([r for r in results if \
+                   isinstance(r, str) and 'budget of 2 used up' in r]))";
+    assert_eq!(run(&code, snippet).await, ("=> (2, 3)".to_string(), false));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!(budget.used(), packs::JevUsed::new(2));
+    let events = events.0.lock().unwrap();
+    let refused = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                packs::JevEvent::Refused { function: "yes_no", reason }
+                    if reason.contains("budget of 2 used up")
+            )
+        })
+        .count();
+    assert_eq!(refused, 3, "{events:?}");
+}
+
+#[tokio::test]
+async fn jev_budget_counts_only_sent_requests() {
+    let (url, recorded) = serve(vec![Canned::json(
+        500,
+        json!({"detail": "down"}).to_string(),
+    )])
+    .await;
+    let budget = Arc::new(packs::JevBudget::new(5));
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+
+    // Invalid questions send nothing and cost nothing.
+    let (text, is_error) = run(&code, "await choose(state='s', question='q', options=[])").await;
+    assert!(
+        is_error && text.contains("ValueError: Invalid jev call"),
+        "{text}"
+    );
+    assert_eq!(budget.used(), packs::JevUsed::new(0));
+    assert!(recorded.lock().unwrap().is_empty());
+    {
+        let events = events.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            packs::JevEvent::Failed {
+                function: "choose",
+                ..
+            }
+        ));
+    }
+
+    // A request that was sent counts even though it failed.
+    let (text, is_error) = run(&code, "await yes_no(state='s', question='q')").await;
+    assert!(
+        is_error && text.contains("RuntimeError: Jev failed"),
+        "{text}"
+    );
+    assert_eq!(budget.used(), packs::JevUsed::new(1));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
 
@@ -889,6 +1186,137 @@ async fn limits_past_the_python_call_timeout_are_rejected() {
         matches!(error.kind(), ErrorKind::Validation { .. }),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn host_call_timeout_is_configurable() {
+    let pool = test_pool().await;
+    let pack = || Pack::new("fakes", "fakes").with_host(nap(50));
+    let limits = Limits {
+        host_call_timeout: Duration::from_secs(60),
+        ..Limits::default()
+    };
+    let code = CodeMode::try_new(pool.clone(), vec![pack()], limits).unwrap();
+    assert_eq!(run(&code, "await nap()").await, ("=> None".to_string(), false));
+
+    let code = CodeMode::try_new(pool, vec![pack()], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await nap()").await;
+    assert!(is_error);
+    assert!(
+        text.contains("RuntimeError: nap() timed out after 45s"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn python_call_timeout_is_configurable() {
+    let pack = Pack::new("fakes", "fakes").with_host(nap(65));
+    let limits = Limits {
+        host_call_timeout: Duration::from_secs(70),
+        python_call_timeout: Duration::from_secs(200),
+        ..Limits::default()
+    };
+    let code = CodeMode::try_new(test_pool().await, vec![pack], limits).unwrap();
+    // Two 65 s host calls: 130 s in one python call, past the 120 s default.
+    assert_eq!(
+        run(&code, "await nap()\nawait nap()").await,
+        ("=> None".to_string(), false)
+    );
+}
+
+#[tokio::test]
+async fn limits_past_a_configured_python_call_timeout_are_rejected() {
+    let pool = test_pool().await;
+    let limits = |python_call_timeout| Limits {
+        max_feed_duration: Duration::from_secs(200),
+        max_turn_duration: Duration::from_secs(200),
+        python_call_timeout,
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(pool.clone(), vec![], limits(Duration::from_secs(120)))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(100),
+        max_turn_duration: Duration::from_secs(100),
+        python_call_timeout: Duration::from_secs(100),
+        ..Limits::default()
+    };
+    assert!(CodeMode::try_new(pool.clone(), vec![], limits).is_err());
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(100),
+        max_turn_duration: Duration::from_secs(100),
+        python_call_timeout: Duration::from_secs(105),
+        ..Limits::default()
+    };
+    assert!(CodeMode::try_new(pool, vec![], limits).is_ok());
+}
+
+fn description(code: &CodeMode) -> String {
+    let ToolUnionParam::CustomTool(tool) = code.definition() else {
+        panic!("expected a custom tool");
+    };
+    tool.description.unwrap()
+}
+
+#[tokio::test]
+async fn definition_is_the_same_for_the_same_packs() {
+    let pool = test_pool().await;
+    let build = || {
+        CodeMode::try_new(
+            pool.clone(),
+            vec![packs::reports(), fake_firecrawl()],
+            Limits::default(),
+        )
+        .unwrap()
+    };
+    let first = serde_json::to_string(&build().definition()).unwrap();
+    assert_eq!(first, serde_json::to_string(&build().definition()).unwrap());
+    let fresh = serde_json::to_string(&build().with_fresh_sessions().definition()).unwrap();
+    assert_eq!(
+        fresh,
+        serde_json::to_string(&build().with_fresh_sessions().definition()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn fresh_sessions_add_only_one_sentence() {
+    let pool = test_pool().await;
+    let build = || CodeMode::try_new(pool.clone(), vec![packs::reports()], Limits::default());
+    let kept = description(&build().unwrap());
+    let fresh = description(&build().unwrap().with_fresh_sessions());
+    let opening = "Run Python (a sandboxed subset of Python 3.14) in a session that keeps \
+                   variables between calls,\nincluding ones assigned before an error.";
+    let rest = kept.strip_prefix(opening).unwrap();
+    assert_eq!(
+        fresh,
+        format!(
+            "{opening} Each turn's python calls run in a fresh session; variables do not carry \
+             over to later turns.{rest}"
+        )
+    );
+}
+
+#[tokio::test]
+async fn limits_past_the_pool_request_timeout_are_rejected() {
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(150),
+        max_turn_duration: Duration::from_secs(150),
+        python_call_timeout: Duration::from_secs(600),
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(test_pool().await, vec![], limits)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("round trip"), "{error}");
 }
 
 // A list holding one list twice, 30 deep: tiny in the sandbox, 2^30 items expanded.

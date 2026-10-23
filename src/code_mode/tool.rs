@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::limits::{HOST_CALL_TIMEOUT, LIMIT_MARGIN, PYTHON_CALL_TIMEOUT};
+use super::limits::{LIMIT_MARGIN, REQUEST_TIMEOUT};
 use super::pack::Function;
 use super::{HostError, HostFunction, Limits, Pack, value};
 use crate::client_tool::ClientTool;
@@ -32,9 +32,12 @@ const RESULT_CHARS: usize = 5_000;
 pub(super) const RESTARTED: &str = "The session restarted; earlier variables are gone.";
 pub(super) const CANCELLED: &str = "The last python call was cancelled before it finished.";
 
-const DESCRIPTION: &str = "Run Python (a sandboxed subset of Python 3.14) in a session that \
+const KEPT_SESSION: &str = "Run Python (a sandboxed subset of Python 3.14) in a session that \
 keeps variables between calls,
-including ones assigned before an error.
+including ones assigned before an error.";
+const FRESH_SESSIONS: &str =
+    " Each turn's python calls run in a fresh session; variables do not carry over to later turns.";
+const DESCRIPTION: &str = "
 Host functions are async and keyword-only; always await them: `hits = await search(query=\"...\", limit=5)`.
 asyncio and re are already imported. asyncio has only run, gather and sleep; gather takes no
 keyword arguments, so to tolerate failures wrap each call in an async def with try/except.
@@ -119,8 +122,8 @@ impl CodeMode {
     /// Fails when two packs or two functions across packs share a name, a pack requires one not
     /// given or has an example for a function it does not define, a function is named `help`,
     /// which is reserved, or the shorter of `max_feed_duration` and
-    /// `max_turn_duration`, plus 5 seconds, passes the 120 second limit on one `python` call, or
-    /// `max_output_chars` is under the 5,000 characters reserved for the value or traceback.
+    /// `max_turn_duration`, plus 5 seconds, passes `python_call_timeout` or the 120 seconds
+    /// [`pool`](super::pool) allows one sandbox round trip, or `max_output_chars` is under the 5,000 characters reserved for the value or traceback.
     pub fn try_new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self> {
         let invalid = |message: String| Error::validation(message, Some("packs".to_string()));
         let names: Vec<&str> = packs
@@ -166,13 +169,25 @@ impl CodeMode {
             }
         }
         let sandbox_limit = limits.max_feed_duration.min(limits.max_turn_duration);
-        if sandbox_limit + LIMIT_MARGIN > PYTHON_CALL_TIMEOUT {
+        if sandbox_limit + LIMIT_MARGIN > REQUEST_TIMEOUT {
             return Err(Error::validation(
                 format!(
                     "max_feed_duration and max_turn_duration must leave one of them under \
-                     {:?}, so the sandbox stops a snippet before the {PYTHON_CALL_TIMEOUT:?} \
+                     {:?}, so the sandbox stops a snippet before the pool's {REQUEST_TIMEOUT:?} \
+                     limit on one round trip kills the worker",
+                    REQUEST_TIMEOUT - LIMIT_MARGIN
+                ),
+                Some("limits".to_string()),
+            ));
+        }
+        let call_timeout = limits.python_call_timeout;
+        if sandbox_limit + LIMIT_MARGIN > call_timeout {
+            return Err(Error::validation(
+                format!(
+                    "max_feed_duration and max_turn_duration must leave one of them under \
+                     {:?}, so the sandbox stops a snippet before the {call_timeout:?} \
                      python call timeout",
-                    PYTHON_CALL_TIMEOUT - LIMIT_MARGIN
+                    call_timeout.saturating_sub(LIMIT_MARGIN)
                 ),
                 Some("limits".to_string()),
             ));
@@ -190,13 +205,21 @@ impl CodeMode {
         Ok(Self {
             pool,
             packs,
-            limits,
             definition,
             session: Mutex::new(None),
             host_calls: AtomicUsize::new(0),
-            host_timeout: HOST_CALL_TIMEOUT,
-            call_timeout: PYTHON_CALL_TIMEOUT,
+            host_timeout: limits.host_call_timeout,
+            call_timeout,
+            limits,
         })
+    }
+
+    /// Tells Claude that variables do not carry over to later turns, for an app that builds a
+    /// new `CodeMode` every turn. Adds one sentence after the tool description's first.
+    #[must_use]
+    pub fn with_fresh_sessions(mut self) -> Self {
+        self.definition = describe(&self.packs, FRESH_SESSIONS);
+        self
     }
 
     /// Ends the session and returns its worker to the pool. Dropping a CodeMode without
@@ -672,6 +695,11 @@ fn is_fatal(exception: &MontyException) -> bool {
 }
 
 pub(super) fn definition(packs: &[Pack]) -> ToolUnionParam {
+    describe(packs, "")
+}
+
+/// The tool definition, with `sessions` after the description's first sentence.
+fn describe(packs: &[Pack], sessions: &str) -> ToolUnionParam {
     let listing: String = packs
         .iter()
         .map(|pack| {
@@ -683,7 +711,7 @@ pub(super) fn definition(packs: &[Pack]) -> ToolUnionParam {
             format!("\n\n{}: {}{functions}", pack.name, pack.summary)
         })
         .collect();
-    let description = format!("{DESCRIPTION}{listing}");
+    let description = format!("{KEPT_SESSION}{sessions}{DESCRIPTION}{listing}");
     let schema = json!({
         "type": "object",
         "properties": {
