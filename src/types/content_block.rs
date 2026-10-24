@@ -112,6 +112,11 @@ pub enum ContentBlock {
     #[serde(rename = "tool_reference")]
     ToolReference(ToolReference),
 
+    /// The result of a server-side web search, such as OpenRouter's `openrouter:web_search`:
+    /// the whole block, `type`, `tool_use_id`, `caller` and `content` included, kept verbatim.
+    #[serde(untagged)]
+    WebSearchToolResult(Value),
+
     /// A block of a type this crate does not know, kept verbatim.
     #[serde(untagged)]
     Unknown(Value),
@@ -146,6 +151,11 @@ impl<'de> Deserialize<'de> for ContentBlock {
             "search_result" => open_union::from_value(value).map(ContentBlock::SearchResult),
             "web_fetch_tool_result" => {
                 open_union::from_value(value).map(ContentBlock::WebFetchToolResult)
+            }
+            "web_search_tool_result" => {
+                // Checked for its required fields, then kept whole.
+                opaque_result::<D::Error>(value.clone())?;
+                Ok(ContentBlock::WebSearchToolResult(value))
             }
             "code_execution_tool_result" => {
                 open_union::from_value(value).map(ContentBlock::CodeExecutionToolResult)
@@ -227,6 +237,7 @@ impl ContentBlock {
             ContentBlock::Fallback(_) => "fallback",
             ContentBlock::SearchResult(_) => "search_result",
             ContentBlock::WebFetchToolResult(_) => "web_fetch_tool_result",
+            ContentBlock::WebSearchToolResult(_) => "web_search_tool_result",
             ContentBlock::CodeExecutionToolResult(_) => "code_execution_tool_result",
             ContentBlock::BashCodeExecutionToolResult { .. } => "bash_code_execution_tool_result",
             ContentBlock::TextEditorCodeExecutionToolResult { .. } => {
@@ -586,6 +597,30 @@ mod tests {
             editor,
             ContentBlock::TextEditorCodeExecutionToolResult { .. }
         ));
+    }
+
+    #[test]
+    fn web_search_tool_result_round_trips_results_and_errors() {
+        let block = round_trip(serde_json::json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_06",
+            "caller": {"type": "direct"},
+            "content": [{
+                "type": "web_search_result",
+                "url": "https://example.com",
+                "title": "Example",
+                "encrypted_content": "abc",
+                "page_age": null
+            }]
+        }));
+        assert_eq!(block.type_name(), "web_search_tool_result");
+        assert!(matches!(block, ContentBlock::WebSearchToolResult(_)));
+        round_trip(serde_json::json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_06",
+            "caller": {"type": "direct"},
+            "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}
+        }));
     }
 
     #[test]

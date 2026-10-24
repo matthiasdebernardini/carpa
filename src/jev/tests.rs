@@ -1721,3 +1721,61 @@ fn malformed_answer_logs_its_shape_not_its_values() {
     });
     assert!(warnings[0].len() < 400, "{}", warnings[0]);
 }
+
+#[tokio::test]
+async fn openrouter_sends_bearer_auth_to_api_v1_systemone_and_reads_cost() {
+    let jev = JevClient::openrouter("sk-or-key", "typesafe/jev-1.14").unwrap();
+    assert_eq!(jev.base_url, "https://openrouter.ai/api");
+    assert_eq!(jev.model(), "typesafe/jev-1.14");
+
+    // OpenRouter's documented System One response, with its extra `id`, `provider` and cost.
+    let body = json!({
+        "id": "gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
+        "model": "typesafe/jev-1.14-20261001",
+        "provider": "TypeSafe",
+        "answers": {"answer": {"type": "noul", "noul": 0.98}},
+        "usage": {"input_tokens": 275, "output_tokens": 20, "cost": 0.00003}
+    });
+    let (url, recorded) = serve(vec![ok(body)]).await;
+    // The same client with its base URL's host swapped for the mock server's.
+    let jev = jev.with_base_url(&format!("{url}/api")).unwrap();
+    let outcome = jev
+        .yes_no(
+            "I was charged twice.",
+            "Does the customer want money back?",
+            0.5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Outcome::Answered(true));
+
+    let recorded = recorded.lock().unwrap();
+    let first_line = recorded[0].headers.lines().next().unwrap();
+    assert!(
+        first_line.starts_with("POST /api/v1/systemone "),
+        "{first_line}"
+    );
+    assert_eq!(
+        header(&recorded[0], "authorization"),
+        Some("Bearer sk-or-key")
+    );
+    let sent: Value = serde_json::from_str(&recorded[0].body).unwrap();
+    assert_eq!(sent["model"], "typesafe/jev-1.14");
+}
+
+#[test]
+fn usage_cost_is_read_when_present() {
+    let response = parsed(json!({
+        "model": "typesafe/jev-1.14",
+        "answers": {},
+        "usage": {"input_tokens": 275, "output_tokens": 20, "cost": 0.00003}
+    }));
+    assert_eq!(response.cost, Some(0.00003));
+    assert_eq!(response.usage.input_tokens, Some(275));
+    assert_eq!(response.usage.output_tokens, Some(20));
+    assert_eq!(parsed(triage_response()).cost, None);
+    assert_eq!(
+        parsed(json!({"model": "jev-1.13.0", "answers": {}})).cost,
+        None
+    );
+}

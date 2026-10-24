@@ -244,8 +244,15 @@ fn message_betas(params: &MessageCreateParams) -> Vec<&'static str> {
 /// `Authorization: Bearer ${API_KEY}` on every request.
 ///
 /// Baseten's Anthropic-compatible inference gateway is one such provider: it
-/// expects a bearer token instead of `x-api-key`.
+/// expects a bearer token instead of `x-api-key`. OpenRouter is another, matched by host
+/// (see [`is_openrouter`]).
 const BASE_URLS_REQUIRING_AUTH_HEADER: &[&str] = &["https://inference.baseten.co"];
+
+/// OpenRouter's Anthropic-compatible Messages endpoint; requests go to `/api/v1/messages`.
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api";
+
+/// OpenRouter's host; its regional hosts, such as `eu.openrouter.ai`, are subdomains of it.
+const OPENROUTER_HOST: &str = "openrouter.ai";
 
 /// Checks a base URL with the shared https rule (see [`base_url::checked_url`]) and normalizes
 /// it: removes trailing slashes and one final `v1` path segment, which [`Anthropic::build_url`]
@@ -264,12 +271,28 @@ fn normalized_base_url(setting: &str, base_url: &str) -> Result<String> {
 }
 
 /// Returns `true` when `base_url` (after trimming any trailing slash) matches
-/// one of the entries in [`BASE_URLS_REQUIRING_AUTH_HEADER`].
+/// one of the entries in [`BASE_URLS_REQUIRING_AUTH_HEADER`], or is an OpenRouter URL.
 fn requires_auth_header(base_url: &str) -> bool {
     let normalized = base_url.trim_end_matches('/');
-    BASE_URLS_REQUIRING_AUTH_HEADER
-        .iter()
-        .any(|url| url.trim_end_matches('/') == normalized)
+    is_openrouter(base_url)
+        || BASE_URLS_REQUIRING_AUTH_HEADER
+            .iter()
+            .any(|url| url.trim_end_matches('/') == normalized)
+}
+
+/// Returns `true` when the host of `base_url` is `openrouter.ai` or a subdomain of it, in any
+/// letter case.
+fn is_openrouter(base_url: &str) -> bool {
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == OPENROUTER_HOST
+            || host
+                .strip_suffix(OPENROUTER_HOST)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 const MAX_MESSAGE_BATCH_RESULT_LINE_BYTES: usize = 64 * 1024 * 1024;
@@ -556,8 +579,23 @@ impl Anthropic {
     /// variables, in that order. If neither is set, the default Anthropic API URL is used. A
     /// configured base URL follows the rule of [`Anthropic::with_base_url`]; a URL that breaks it
     /// is a validation error naming the variable.
+    ///
+    /// When the base URL's host is `openrouter.ai` or a subdomain of it, such as
+    /// `eu.openrouter.ai`, the key is read from
+    /// CARPA_API_KEY or OPENROUTER_API_KEY instead: OPENROUTER_API_KEY is read only for
+    /// OpenRouter and ANTHROPIC_API_KEY never for it. See [`Anthropic::openrouter`].
     pub fn try_new(api_key: Option<String>) -> Result<Self> {
         Self::try_new_with(api_key, env_value)
+    }
+
+    /// Create a client for OpenRouter's Anthropic-compatible Messages endpoint.
+    ///
+    /// Requests go to `https://openrouter.ai/api/v1/messages` with the OpenRouter key as
+    /// `Authorization: Bearer`. Name models by OpenRouter slug, such as
+    /// `Model::Custom("anthropic/claude-sonnet-5.5".into())`. A key of the form `file:///path`
+    /// is read from that file. The base URL environment variables are not read.
+    pub fn openrouter(api_key: &str) -> Result<Self> {
+        Self::with_key_and_base_url(api_key, OPENROUTER_BASE_URL.to_string())
     }
 
     /// [`Anthropic::try_new`] with the configuration read through `get` instead of the process
@@ -566,30 +604,39 @@ impl Anthropic {
         api_key: Option<String>,
         get: impl Fn(&str) -> Result<Option<String>>,
     ) -> Result<Self> {
-        let key = match api_key {
-            Some(key) => key,
-            None => configured_value(&get, &["CARPA_API_KEY", "ANTHROPIC_API_KEY"])?
-                .map(|(_, key)| key)
-                .ok_or_else(|| {
-                    Error::validation(
-                        "No nonempty API key configured in CARPA_API_KEY or ANTHROPIC_API_KEY",
-                        Some("api_key".to_string()),
-                    )
-                })?,
-        };
-        let api_key = Self::resolve_api_key(&key)?;
-
-        // Resolve base URL from environment variables, defaulting to the API URL.
-        // This is resolved before building headers because some providers
-        // (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
-        // header derived from the base URL.
         let configured = configured_value(&get, &["CARPA_BASE_URL", "ANTHROPIC_BASE_URL"])?;
         let base_url = match configured {
             Some((name, url)) => normalized_base_url(name, &url)?,
             None => DEFAULT_API_URL.to_string(),
         };
+        let key_names: &[&str] = if is_openrouter(&base_url) {
+            &["CARPA_API_KEY", "OPENROUTER_API_KEY"]
+        } else {
+            &["CARPA_API_KEY", "ANTHROPIC_API_KEY"]
+        };
+        let key = match api_key {
+            Some(key) => key,
+            None => configured_value(&get, key_names)?
+                .map(|(_, key)| key)
+                .ok_or_else(|| {
+                    Error::validation(
+                        format!(
+                            "No nonempty API key configured in {}",
+                            key_names.join(" or ")
+                        ),
+                        Some("api_key".to_string()),
+                    )
+                })?,
+        };
+        Self::with_key_and_base_url(&key, base_url)
+    }
 
-        // Pre-build headers for performance
+    /// Builds a client from a key (a `file://` value is read from the file) and a normalized
+    /// base URL.
+    fn with_key_and_base_url(key: &str, base_url: String) -> Result<Self> {
+        let api_key = Self::resolve_api_key(key)?;
+        // Some providers (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
+        // header derived from the base URL.
         let cached_headers = Self::build_default_headers(&api_key, &base_url)?;
         let timeout = DEFAULT_TIMEOUT;
 
@@ -1507,9 +1554,10 @@ mod tests {
         Canned, Recorded, read_request, record_events, record_targets, serve, uses_proxies,
     };
     use crate::{
-        KnownModel, McpToolset, MessageBatchCreateParams, MessageBatchCreateRequest,
-        MessageBatchListParams, MessageBatchResultVariant, MessageParam, Model, TaskBudget,
-        ThinkingConfig, ThinkingDisplay,
+        ContentBlock, KnownModel, McpToolset, MessageBatchCreateParams, MessageBatchCreateRequest,
+        MessageBatchListParams, MessageBatchResultVariant, MessageParam, MessageRole, Model,
+        OpenRouterSearchEngine, OpenRouterWebSearchTool, TaskBudget, ThinkingConfig,
+        ThinkingDisplay,
     };
     use futures::StreamExt;
     use serde_json::Value;
@@ -2822,12 +2870,238 @@ Connection: close\r\n\r\n",
             matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("ANTHROPIC_BASE_URL")),
             "{error}"
         );
-        let error = Anthropic::try_new_with(key(), env(&[("CARPA_BASE_URL", "http://v1")]))
-            .unwrap_err();
+        let error =
+            Anthropic::try_new_with(key(), env(&[("CARPA_BASE_URL", "http://v1")])).unwrap_err();
         assert!(
             matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("CARPA_BASE_URL")),
             "{error}"
         );
+    }
+
+    #[test]
+    fn openrouter_base_url_reads_only_the_openrouter_key() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                Ok(pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string()))
+            }
+        };
+
+        let client = Anthropic::try_new_with(
+            None,
+            env(&[
+                ("CARPA_BASE_URL", "https://openrouter.ai/api/v1/"),
+                ("ANTHROPIC_API_KEY", "sk-ant-key"),
+                ("OPENROUTER_API_KEY", "sk-or-key"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(client.base_url, OPENROUTER_BASE_URL);
+        assert_eq!(client.api_key(), "sk-or-key");
+        assert_eq!(
+            client.default_headers()["authorization"],
+            "Bearer sk-or-key"
+        );
+
+        let error = Anthropic::try_new_with(
+            None,
+            env(&[
+                ("ANTHROPIC_BASE_URL", "https://openrouter.ai/api"),
+                ("ANTHROPIC_API_KEY", "sk-ant-key"),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "No nonempty API key configured in CARPA_API_KEY or OPENROUTER_API_KEY"
+        );
+
+        let client = Anthropic::try_new_with(
+            None,
+            env(&[
+                ("ANTHROPIC_API_KEY", "sk-ant-key"),
+                ("OPENROUTER_API_KEY", "sk-or-key"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(client.base_url, DEFAULT_API_URL);
+        assert_eq!(client.api_key(), "sk-ant-key");
+        assert!(!client.default_headers().contains_key("authorization"));
+    }
+
+    #[test]
+    fn openrouter_is_matched_by_host() {
+        for url in [
+            "https://openrouter.ai/api",
+            "https://openrouter.ai",
+            "https://eu.openrouter.ai/api",
+            "https://US.OpenRouter.AI/api",
+        ] {
+            assert!(is_openrouter(url), "{url}");
+            assert!(requires_auth_header(url), "{url}");
+        }
+        for url in [
+            "https://notopenrouter.ai/api",
+            "https://openrouter.ai.example.com/api",
+            "https://api.anthropic.com",
+            "http://localhost:9000/openrouter.ai",
+        ] {
+            assert!(!is_openrouter(url), "{url}");
+            assert!(!requires_auth_header(url), "{url}");
+        }
+        assert!(requires_auth_header("https://inference.baseten.co"));
+    }
+
+    #[test]
+    fn openrouter_hosts_read_the_openrouter_key_from_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                Ok(pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string()))
+            }
+        };
+        for base_url in ["https://openrouter.ai", "https://eu.openrouter.ai/api"] {
+            let get = move |name: &str| {
+                Ok(match name {
+                    "CARPA_BASE_URL" => Some(base_url.to_string()),
+                    "ANTHROPIC_API_KEY" => Some("sk-ant-key".to_string()),
+                    "OPENROUTER_API_KEY" => Some("sk-or-key".to_string()),
+                    _ => None,
+                })
+            };
+            let client = Anthropic::try_new_with(None, get).unwrap();
+            let headers = client.default_headers();
+            assert_eq!(headers["x-api-key"], "sk-or-key", "{base_url}");
+            assert_eq!(headers["authorization"], "Bearer sk-or-key", "{base_url}");
+        }
+
+        let client = Anthropic::try_new_with(
+            None,
+            env(&[
+                ("CARPA_BASE_URL", "https://openrouter.ai/api"),
+                ("CARPA_API_KEY", "sk-carpa-key"),
+                ("OPENROUTER_API_KEY", "sk-or-key"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(client.api_key(), "sk-carpa-key");
+        assert_eq!(
+            client.default_headers()["authorization"],
+            "Bearer sk-carpa-key"
+        );
+    }
+
+    #[test]
+    fn openrouter_reads_a_file_key() {
+        let test_dir =
+            std::env::temp_dir().join(format!("carpa_openrouter_test_{}", std::process::id()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let test_file = test_dir.join("openrouter_key.txt");
+        std::fs::write(&test_file, "sk-or-from-file\n").unwrap();
+
+        let client = Anthropic::openrouter(&format!("file://{}", test_file.display()));
+        std::fs::remove_dir_all(&test_dir).unwrap();
+
+        let client = client.unwrap();
+        assert_eq!(client.api_key(), "sk-or-from-file");
+        assert_eq!(
+            client.default_headers()["authorization"],
+            "Bearer sk-or-from-file"
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_sends_bearer_auth_to_api_v1_messages_and_reads_web_search_blocks() {
+        let search_call = serde_json::json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_01",
+            "name": "web_search",
+            "input": {"query": "rust 2024 edition"}
+        });
+        let search_result = serde_json::json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_01",
+            "caller": {"type": "direct"},
+            "content": [{
+                "type": "web_search_result",
+                "url": "https://doc.rust-lang.org/edition-guide/",
+                "title": "The Rust Edition Guide",
+                "encrypted_content": "abc",
+                "page_age": null
+            }]
+        });
+        let answer = serde_json::json!({
+            "type": "text",
+            "text": "Rust 2024 shipped with 1.85.",
+            "citations": [{
+                "type": "web_search_result_location",
+                "url": "https://doc.rust-lang.org/edition-guide/",
+                "title": "The Rust Edition Guide",
+                "encrypted_index": "xyz",
+                "cited_text": "Rust 2024"
+            }]
+        });
+        let body = serde_json::json!({
+            "id": "gen-1",
+            "type": "message",
+            "role": "assistant",
+            "model": "anthropic/claude-sonnet-5.5",
+            "provider": "Anthropic",
+            "content": [search_call, search_result, answer],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cost": 0.0123,
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0}
+            }
+        });
+        let (mock, recorded) = serve(vec![Canned::json(200, body.to_string())]).await;
+
+        let mut client = Anthropic::openrouter("sk-or-key").unwrap();
+        assert_eq!(client.base_url, "https://openrouter.ai/api");
+        // Point the OpenRouter client, headers unchanged, at the mock server's `/api`.
+        client.base_url = format!("{mock}/api");
+        client.rebuild_http_clients().unwrap();
+        let params = MessageCreateParams::simple(
+            "What is new in Rust 2024?",
+            Model::Custom("anthropic/claude-sonnet-5.5".to_string()),
+        )
+        .with_tools(vec![ToolUnionParam::OpenRouterWebSearch(
+            OpenRouterWebSearchTool::new().with_engine(OpenRouterSearchEngine::Firecrawl),
+        )]);
+        let message = client.send(&params).await.unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(request_line(&requests[0]), "POST /api/v1/messages HTTP/1.1");
+        assert_eq!(
+            header(&requests[0], "authorization"),
+            Some("Bearer sk-or-key")
+        );
+        let sent: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(
+            sent["tools"],
+            serde_json::json!([{"type": "openrouter:web_search", "parameters": {"engine": "firecrawl"}}])
+        );
+        assert_eq!(sent["model"], "anthropic/claude-sonnet-5.5");
+
+        assert!(matches!(message.content[0], ContentBlock::ServerToolUse(_)));
+        assert!(matches!(
+            message.content[1],
+            ContentBlock::WebSearchToolResult(_)
+        ));
+        // The assistant turn goes back exactly as it came.
+        let echoed = serde_json::to_value(MessageParam::new_with_blocks(
+            message.content.clone(),
+            MessageRole::Assistant,
+        ))
+        .unwrap();
+        assert_eq!(echoed["content"], body["content"]);
     }
 
     #[test]

@@ -49,6 +49,8 @@ mod model_info;
 mod model_lifecycle;
 mod model_list_params;
 mod model_list_response;
+mod openrouter_web_fetch_tool;
+mod openrouter_web_search_tool;
 mod output_config;
 mod output_format;
 mod output_tokens_details;
@@ -175,6 +177,13 @@ pub use model_lifecycle::ModelLifecycle;
 pub use model_list_params::ModelListParams;
 pub use model_list_response::ModelListResponse;
 pub(crate) use open_union::warn_unknown;
+pub use openrouter_web_fetch_tool::{
+    OpenRouterFetchEngine, OpenRouterWebFetchParameters, OpenRouterWebFetchTool,
+};
+pub use openrouter_web_search_tool::{
+    OpenRouterSearchContextSize, OpenRouterSearchEngine, OpenRouterSearchMode,
+    OpenRouterUserLocation, OpenRouterWebSearchParameters, OpenRouterWebSearchTool,
+};
 pub use output_config::{Effort, OutputConfig, TaskBudget};
 pub use output_format::OutputFormat;
 pub use output_tokens_details::OutputTokensDetails;

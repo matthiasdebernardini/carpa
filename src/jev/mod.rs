@@ -14,6 +14,7 @@
 //! use carpa::jev::{JevClient, Outcome, Questions};
 //!
 //! let jev = JevClient::try_new("ts-key", "jev-1.13.0")?;
+//! // Or through OpenRouter: JevClient::openrouter("sk-or-key", "typesafe/jev-1.14")?
 //! let questions = Questions::new()
 //!     .noul("refund", "Does the customer ask for a refund?")
 //!     .choice(

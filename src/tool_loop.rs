@@ -244,7 +244,8 @@ impl Anthropic {
     }
 }
 
-/// The name a tool definition gives Claude; an MCP toolset names a server, not a tool.
+/// The name a tool definition gives Claude; an MCP toolset names a server, not a tool, and
+/// OpenRouter's server tools take no name.
 fn tool_name(tool: &ToolUnionParam) -> Option<&str> {
     match tool {
         ToolUnionParam::CustomTool(tool) => Some(&tool.name),
@@ -263,7 +264,9 @@ fn tool_name(tool: &ToolUnionParam) -> Option<&str> {
         ToolUnionParam::ToolSearchToolRegex20251119(tool)
         | ToolUnionParam::ToolSearchToolBm2520251119(tool) => Some(&tool.name),
         ToolUnionParam::Memory20250818(tool) => Some(&tool.name),
-        ToolUnionParam::McpToolset(_) => None,
+        ToolUnionParam::McpToolset(_)
+        | ToolUnionParam::OpenRouterWebSearch(_)
+        | ToolUnionParam::OpenRouterWebFetch(_) => None,
     }
 }
 

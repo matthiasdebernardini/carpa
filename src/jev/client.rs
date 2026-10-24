@@ -17,6 +17,8 @@ use crate::http::{self, header_str};
 use crate::types::retry_after_from_headers;
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+/// OpenRouter's TypeSafe-compatible System One API; requests go to `/api/v1/systemone`.
+pub(super) const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api";
 const PATH: &str = "/v1/systemone";
 const API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const MODEL_ENV: &str = "TYPESAFE_DEFAULT_MODEL";
@@ -40,7 +42,8 @@ pub(crate) struct Prepared(Bytes);
 ///
 /// The API key is only kept as a sensitive header value and is redacted from `Debug`. There is
 /// no default model: answer thresholds are tuned per model and aliases such as `jev-latest`
-/// move, so pin a versioned id such as `jev-1.13.0`.
+/// move, so pin a versioned id such as `jev-1.13.0`, or `typesafe/jev-1.14` through
+/// [`JevClient::openrouter`].
 #[derive(Clone)]
 pub struct JevClient {
     pub(super) http: ReqwestClient,
@@ -70,6 +73,7 @@ impl JevClient {
     ///
     /// Pin a versioned model id such as `jev-1.13.0`; aliases like `jev-latest` move and
     /// confidence thresholds tuned on one model do not carry over to the next.
+    /// [`JevClient::openrouter`] asks Jev through OpenRouter instead.
     ///
     /// Fails when the key is empty after trimming or is not printable ASCII without
     /// whitespace, when the model is empty after trimming, or when the HTTP client cannot be
@@ -92,6 +96,17 @@ impl JevClient {
             max_retries: DEFAULT_MAX_RETRIES,
             retry_budget: DEFAULT_RETRY_BUDGET,
         })
+    }
+
+    /// Create a client that asks Jev through OpenRouter's System One API with an OpenRouter
+    /// key.
+    ///
+    /// Requests go to `https://openrouter.ai/api/v1/systemone` and are billed to the
+    /// OpenRouter account; [`JevResponse::cost`] holds the charge. Pin an OpenRouter id such
+    /// as `typesafe/jev-1.14` or `typesafe/jev-1.13`; `~typesafe/jev-latest` moves. Fails as
+    /// [`JevClient::try_new`] does.
+    pub fn openrouter(api_key: &str, model: &str) -> Result<Self> {
+        Self::try_new(api_key, model)?.with_base_url(OPENROUTER_BASE_URL)
     }
 
     /// Create a client from `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`, both required, and

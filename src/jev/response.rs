@@ -35,6 +35,8 @@ pub struct JevResponse {
     pub answers: Vec<NamedAnswer>,
     /// Tokens consumed.
     pub usage: JevUsage,
+    /// The charge in USD, from OpenRouter's `usage.cost`; `None` from TypeSafe directly.
+    pub cost: Option<f64>,
     /// `x-typesafe-request-id`, or `cf-ray` when that is missing.
     pub request_id: Option<String>,
     /// Attempts made, 1 when the first succeeded.
@@ -61,6 +63,7 @@ impl fmt::Debug for JevResponse {
             .field("model", &self.model)
             .field("answers", &self.answers)
             .field("usage", &self.usage)
+            .field("cost", &self.cost)
             .field("request_id", &self.request_id)
             .field("attempts", &self.attempts)
             .field("request_body_bytes", &self.request_body.len())
@@ -74,7 +77,15 @@ struct WireResponse {
     model: String,
     answers: serde_json::Map<String, Value>,
     #[serde(default)]
-    usage: Option<JevUsage>,
+    usage: Option<WireUsage>,
+}
+
+#[derive(Deserialize)]
+struct WireUsage {
+    #[serde(flatten)]
+    tokens: JevUsage,
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 impl JevResponse {
@@ -109,7 +120,12 @@ impl JevResponse {
         Ok(Self {
             model: wire.model,
             answers,
-            usage: wire.usage.unwrap_or_default(),
+            usage: wire
+                .usage
+                .as_ref()
+                .map(|usage| usage.tokens)
+                .unwrap_or_default(),
+            cost: wire.usage.and_then(|usage| usage.cost),
             request_id,
             attempts,
             request_body,

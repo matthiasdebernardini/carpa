@@ -24,6 +24,7 @@ Carpa is a fork of Robert Escriva's [claudius](https://github.com/rescrv/claudiu
 - [Tools](#tools): custom tools, Anthropic-defined tools, the tool loop
 - [Web search and page fetch: Firecrawl](#web-search-and-page-fetch-firecrawl)
 - [Typed judgments: Jev](#typed-judgments-jev)
+- [OpenRouter](#openrouter): Claude and Jev with one key, OpenRouter's web search and fetch
 - [Semantic search: turbopuffer](#semantic-search-turbopuffer)
 - [Code mode](#code-mode)
 - [Prompt caching](#prompt-caching)
@@ -91,7 +92,7 @@ A reply cut off at `max_tokens` has a stop reason of `StopReason::MaxTokens`.
 
 | Setting | Read from | Notes |
 |---|---|---|
-| API key | `CARPA_API_KEY`, then `ANTHROPIC_API_KEY` | Or pass `Anthropic::try_new(Some(key))`. |
+| API key | `CARPA_API_KEY`, then `ANTHROPIC_API_KEY` (`OPENROUTER_API_KEY` for OpenRouter's base URL) | Or pass `Anthropic::try_new(Some(key))`. See [OpenRouter](#openrouter). |
 | Base URL | `CARPA_BASE_URL`, then `ANTHROPIC_BASE_URL` | Optional; a trailing `/v1` is allowed. |
 
 A key value of the form `file:///path` is read from that file, which keeps the key itself out of the environment.
@@ -518,7 +519,7 @@ Create the client with `JevClient::try_new`, which takes the key and the model, 
 | `TYPESAFE_DEFAULT_MODEL` | yes | the Jev model to ask |
 | `TYPESAFE_BASE_URL` | no | another host, such as staging |
 
-There is no default model. Pin a versioned ID such as `jev-1.13.0`. Aliases such as `jev-latest` move, and confidence thresholds tuned on one model do not carry over to the next.
+There is no default model. Pin a versioned ID such as `jev-1.13.0`, or `typesafe/jev-1.14` [through OpenRouter](#openrouter). Aliases such as `jev-latest` move, and confidence thresholds tuned on one model do not carry over to the next.
 
 ### Confidence and outcomes
 
@@ -554,6 +555,60 @@ A request is sent again when its error is retryable (see [Errors and retries](#e
 Its input is a list of `ToolQuestion`s. Apps that take questions in the same shape can turn them into `Questions` with `Questions::from_tool` and render a response as the tool does with `jev::answers`.
 
 Problems the model or a retry can fix, such as bad input, 429, 5xx or a timeout, come back as `is_error` results. A rejected key (401) and other configuration problems are returned as `Err`, which stops the tool loop.
+
+## OpenRouter
+
+One [OpenRouter](https://openrouter.ai) key can route both Claude and Jev through OpenRouter, billed to the OpenRouter account.
+
+`Anthropic::openrouter(key)` sends Messages requests to `https://openrouter.ai/api/v1/messages` with the key as `Authorization: Bearer`. Name the model by its OpenRouter slug through `Model::Custom`, such as `anthropic/claude-sonnet-5.5`. From the environment, set `CARPA_BASE_URL=https://openrouter.ai/api` and `OPENROUTER_API_KEY`; for a base URL on `openrouter.ai` or a subdomain such as `eu.openrouter.ai`, `Anthropic::try_new(None)` reads `CARPA_API_KEY` or `OPENROUTER_API_KEY` and never `ANTHROPIC_API_KEY`. Carpa's own price tables do not cover OpenRouter slugs.
+
+`JevClient::openrouter(key, model)` sends Jev requests to `https://openrouter.ai/api/v1/systemone`. Pin an OpenRouter ID such as `typesafe/jev-1.14` or `typesafe/jev-1.13`; `~typesafe/jev-latest` moves. `JevResponse::cost` holds the charge in USD.
+
+OpenRouter runs two web tools on its own side, so Claude's reply carries `server_tool_use` and result blocks, and `run_tools` has nothing to call:
+
+| Tool | Variant | Engines |
+|---|---|---|
+| `openrouter:web_search` | `ToolUnionParam::OpenRouterWebSearch(OpenRouterWebSearchTool)` | `auto`, `native`, `exa`, `firecrawl`, `parallel`, `perplexity` |
+| `openrouter:web_fetch` | `ToolUnionParam::OpenRouterWebFetch(OpenRouterWebFetchTool)` | `auto`, `native`, `exa`, `openrouter`, `firecrawl`, `parallel` |
+
+The `firecrawl` engine uses OpenRouter's Firecrawl key, so it needs no Firecrawl account and bills OpenRouter credits.
+
+```rust,no_run
+use carpa::{
+    Anthropic, MessageCreateParams, Model, OpenRouterFetchEngine, OpenRouterSearchEngine,
+    OpenRouterWebFetchTool, OpenRouterWebSearchTool, ToolUnionParam,
+};
+use carpa::jev::JevClient;
+
+async fn ask(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let claude = Anthropic::openrouter(key)?;
+    let params = MessageCreateParams::simple(
+        "What changed in the latest Rust release? Cite a source.",
+        Model::Custom("anthropic/claude-sonnet-5.5".to_string()),
+    )
+    .with_tools(vec![
+        ToolUnionParam::OpenRouterWebSearch(
+            OpenRouterWebSearchTool::new()
+                .with_engine(OpenRouterSearchEngine::Firecrawl)
+                .with_max_results(5),
+        ),
+        ToolUnionParam::OpenRouterWebFetch(
+            OpenRouterWebFetchTool::new().with_engine(OpenRouterFetchEngine::Firecrawl),
+        ),
+    ]);
+    let run = claude.run_tools(params, &[], 3).await?;
+    println!("{}", run.text().unwrap_or_default());
+
+    let jev = JevClient::openrouter(key, "typesafe/jev-1.14")?;
+    let refund = jev
+        .yes_no("I was charged twice.", "Does the customer want money back?", 0.8)
+        .await?;
+    println!("refund: {refund:?}");
+    Ok(())
+}
+```
+
+Two caveats. OpenRouter says Claude through it is only guaranteed to work with Anthropic as the provider, so pin Anthropic first in your OpenRouter provider settings. OpenRouter marks its server tools as beta, and their behavior may change.
 
 ## Semantic search: turbopuffer
 
@@ -1437,6 +1492,7 @@ The tool examples need more keys:
 |---|---|---|
 | `firecrawl_web_search` | web search by hand | `FIRECRAWL_API_KEY` |
 | `claude_tools` | `run_tools` with Firecrawl and Jev | `FIRECRAWL_API_KEY` and the two Jev variables |
+| `openrouter` | Claude with `openrouter:web_search` (pass `firecrawl` for that engine) and one Jev question, with Jev's cost | `OPENROUTER_API_KEY` |
 | `turbopuffer_search` | writing, searching and citing a throwaway namespace; run with `--features turbopuffer` | `TURBOPUFFER_API_KEY` and `TURBOPUFFER_REGION` |
 
 The Jev variables are `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`.

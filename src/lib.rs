@@ -14,6 +14,9 @@
 //! feature adds an embedded SurrealDB for memory, transcripts, a Firecrawl cache and a usage
 //! ledger. With the `turbopuffer` feature, the `turbopuffer` module lets Claude search the app's
 //! own documents by meaning and by exact words, as a client-side tool over turbopuffer's SDK.
+//! [`Anthropic::openrouter`] and [`jev::JevClient::openrouter`] route Claude and Jev through
+//! OpenRouter with one key, with OpenRouter's server-side web search and fetch as
+//! [`ToolUnionParam`] variants.
 
 mod accumulating_stream;
 mod anthropic;

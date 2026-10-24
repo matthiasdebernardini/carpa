@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    BashTool, CodeExecutionTool, McpToolset, MemoryTool, TextEditorTool, ToolParam, ToolSearchTool,
-    WebFetchTool,
+    BashTool, CodeExecutionTool, McpToolset, MemoryTool, OpenRouterWebFetchTool,
+    OpenRouterWebSearchTool, TextEditorTool, ToolParam, ToolSearchTool, WebFetchTool,
 };
 
 /// Union type for different tool parameter types.
@@ -14,6 +14,7 @@ use crate::types::{
 /// - Server tools (web fetch, code execution, tool search)
 /// - The client-side memory tool
 /// - MCP toolsets
+/// - OpenRouter's server tools (web search, web fetch), for requests sent through OpenRouter
 ///
 /// The API accepts any of these tool types when tools are provided to Claude. Build one with its
 /// variant and the tool type's constructor, for example
@@ -89,6 +90,14 @@ pub enum ToolUnionParam {
     /// A toolset exposing the tools of an MCP server
     #[serde(rename = "mcp_toolset")]
     McpToolset(McpToolset),
+
+    /// OpenRouter's web search server tool; only OpenRouter accepts it
+    #[serde(rename = "openrouter:web_search")]
+    OpenRouterWebSearch(OpenRouterWebSearchTool),
+
+    /// OpenRouter's web fetch server tool; only OpenRouter accepts it
+    #[serde(rename = "openrouter:web_fetch")]
+    OpenRouterWebFetch(OpenRouterWebFetchTool),
 }
 
 impl ToolUnionParam {
