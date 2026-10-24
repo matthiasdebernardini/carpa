@@ -24,6 +24,7 @@ Topcoat SI is a fork of Robert Escriva's [claudius](https://github.com/rescrv/cl
 - [Tools](#tools): custom tools, Anthropic-defined tools, the tool loop
 - [Web search and page fetch: Firecrawl](#web-search-and-page-fetch-firecrawl)
 - [Typed judgments: Jev](#typed-judgments-jev)
+- [Semantic search: turbopuffer](#semantic-search-turbopuffer)
 - [Code mode](#code-mode)
 - [Prompt caching](#prompt-caching)
 - [Message Batches](#message-batches)
@@ -50,6 +51,7 @@ TLS always goes through rustls.
 |---|---|
 | `code-mode` | Adds [code mode](#code-mode). Off by default. |
 | `surreal` | Adds [SurrealDB](#surrealdb), an embedded database. Off by default. |
+| `turbopuffer` | Adds [semantic search through turbopuffer](#semantic-search-turbopuffer). Off by default. |
 
 ## A first request
 
@@ -246,7 +248,7 @@ There is no Anthropic server-side web search here. Web search is a client tool b
 
 ### The `ClientTool` trait
 
-`ClientTool` packages a tool's definition with the code that answers it. Every tool in this crate implements it (Firecrawl, Jev and code mode), so they all plug into the same tool loop.
+`ClientTool` packages a tool's definition with the code that answers it. Every tool in this crate implements it (Firecrawl, Jev, turbopuffer and code mode), so they all plug into the same tool loop.
 
 ```rust
 use futures::future::BoxFuture;
@@ -555,6 +557,130 @@ Its input is a list of `ToolQuestion`s. Apps that take questions in the same sha
 
 Problems the model or a retry can fix, such as bad input, 429, 5xx or a timeout, come back as `is_error` results. A rejected key (401) and other configuration problems are returned as `Err`, which stops the tool loop.
 
+## Semantic search: turbopuffer
+
+[turbopuffer](https://turbopuffer.com) is a search database. With the `turbopuffer` feature, Claude can search your app's own documents (help articles, products, notes) by meaning and by exact words. turbopuffer embeds each document's text itself, through the embedding model you pick, so your app never calls an embedding provider.
+
+Writing documents and querying go through turbopuffer's official Rust SDK (Software Development Kit), the [`turbopuffer`](https://docs.rs/turbopuffer) crate. turbopuffer generates it from its API spec, so it stays current with the API. This crate adds only the search tool Claude calls and its code-mode pack.
+
+Enable the feature, and depend on the SDK at the same version for its types:
+
+```toml
+[dependencies.topcoat-si]
+git = "https://github.com/matthiasdebernardini/topcoat-si"
+features = ["turbopuffer"]
+
+[dependencies]
+turbopuffer = { version = "0.1.0-beta.1", default-features = false, features = ["rustls"] }
+```
+
+`topcoat_si::turbopuffer` re-exports the SDK's `Client`, `Namespace` and `Filter`. Create the client with `Client::builder().api_key(..).region(..).build()`, or with `Client::from_env()`:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `TURBOPUFFER_API_KEY` | yes | your turbopuffer API key |
+| `TURBOPUFFER_REGION` | unless the base URL has no `{region}` | the region, such as `gcp-us-central1` |
+| `TURBOPUFFER_BASE_URL` | no | another host, such as a BYOC (Bring Your Own Cloud, turbopuffer in your own cloud account) cluster; defaults to `https://{region}.turbopuffer.com` |
+
+A namespace holds one collection of documents. The search tool searches its `text` attribute, so write `text` with an embedding model in the schema: turbopuffer embeds the text on write, and a query embeds with the same model, so querying never names a model. The model is tied to the namespace for life and must be available in your region. `voyage/voyage-4-lite` is a cheap starting point.
+
+```rust,no_run
+#[cfg(feature = "turbopuffer")]
+async fn help_center(
+    anthropic: &topcoat_si::Anthropic,
+    params: topcoat_si::MessageCreateParams,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use topcoat_si::turbopuffer::{Client, Filter, TurbopufferSearch};
+    use turbopuffer::types::{AttributeSchemaConfig, Expr, RankBy, Row};
+
+    // TURBOPUFFER_API_KEY plus TURBOPUFFER_REGION or TURBOPUFFER_BASE_URL.
+    let client = Client::from_env()?;
+    let help = client.namespace("acme-help");
+
+    help.write()
+        .upsert_rows([
+            Row::new("refunds")
+                .insert("text", "Refunds go back to the original card within 5 to 10 business days.")
+                .insert("title", "Refund policy")
+                .insert("url", "https://help.acme.com/refunds"),
+            Row::new("a-4471")
+                .insert("text", "The A-4471 bracket fits 2x4 studs.")
+                .insert("title", "A-4471 bracket")
+                .insert("kind", "product"),
+        ])
+        // The model is part of the namespace for life.
+        .schema([(
+            "text",
+            AttributeSchemaConfig::new("string")
+                .embed("voyage/voyage-4-lite")
+                .full_text_search(true),
+        )])
+        .distance_metric("cosine_distance")
+        .send()
+        .await?;
+
+    // A vector query; the server embeds the text with the model on `text`.
+    let found = help
+        .query()
+        .rank_by(RankBy::ann("text", Expr::embed("can I get my money back?")))
+        .limit(3_u64)
+        .exclude_attributes(["embed_text"])
+        .send()
+        .await?;
+    for row in &found.rows {
+        println!("{} {:?}", row.id, row.dist());
+    }
+
+    help.write().deletes(["a-4471"]).send().await?;
+
+    // Claude searches the namespace and cites what it finds.
+    let search = TurbopufferSearch::try_new(help, "search_help", "Acme's help center articles")?
+        .with_filter(Filter::not_eq("draft", true))?;
+    let run = anthropic
+        .run_tools(params, &[&search], 8)
+        .await
+        .map_err(|failed| failed.error)?;
+    println!("{} model calls", run.responses.len());
+    Ok(())
+}
+```
+
+`topcoat_si::Error` converts from `turbopuffer::Error`, so `?` works on SDK calls in a function returning `topcoat_si::Result`. An HTTP error becomes `ErrorKind::Api { service: Service::Turbopuffer, .. }` with its status and `retry-after`; an SDK timeout becomes `Timeout`, a failed connection `Connection` (or `Interrupted` when the body read failed), and a bad response `Decode`.
+
+The SDK does its own retries; this crate adds none on top. Its rules differ from this crate's other clients, and from the hand-written turbopuffer client this crate used to have:
+
+- It resends after a connection failure, a timeout, or a 408, 409, 429 or 5xx response, for every request, writes included. A 409 means an index is still being built. A write that timed out may already have been applied, so resending it can bill the embeddings twice. Pass `.max_retries(0)` on a write request to send it once and decide yourself.
+- It retries 4 times by default (`Client::builder().max_retries(n)`). Writes are the exception: every write request defaults to 6 retries, whatever the client's `max_retries` says, unless the write request itself sets `.max_retries(n)`. Each attempt times out after 60 s (`.timeout(d)`).
+- It never resends a request whose response body failed to arrive partway; that fails at once.
+- It waits the server's `retry-after` when one is sent, up to 30 minutes; a longer one falls back to its backoff, which doubles from 250 ms up to 8 s. It never gives up early on a long `retry-after`.
+
+### turbopuffer as a tool
+
+`TurbopufferSearch::try_new(namespace, name, corpus)` gives Claude one namespace as a client tool named `name`. The name must be a lowercase Python identifier, such as `search_help`, and should not shadow a Python builtin; `help` is taken by code mode.
+
+The tool is read-only: Claude can search, never write. A filter set with `with_filter` applies to every call, and Claude cannot remove or widen it. `with_filter` returns `Err` for a filter with an empty `Filter::and` or `Filter::or` anywhere, which would match everything or fail every search. Each hit becomes a citable search result whose source is the document's `url` attribute, or `turbopuffer://{namespace}/{id}` without one. At most 10 hits come back per call, each text cut after 4,000 characters by default.
+
+Hybrid search (the default) runs a vector search, which matches meaning, and a BM25 keyword search, which matches exact words, and fuses them with RRF (Reciprocal Rank Fusion, merging two ranked lists by position). Claude can ask for `keyword`, which suits exact names, codes and ids, or `vector`, which suits loose paraphrase. A hit's `score` is higher for better matches in every mode, but scores from different modes cannot be compared.
+
+A blank query, 400 and cut-off responses (which the SDK never resends) come back as `is_error` results, and so do 408, 409, 429, 5xx, timeouts and connection failures once the SDK's retries run out. A rejected key (401 or 403) or a request the SDK cannot build is returned as `Err`, which stops the tool loop. A namespace that was never written answers "No documents match" and logs a warning, so a new tenant works and a typo or wrong region shows in your logs.
+
+With code mode as well, `packs::turbopuffer([search])` turns each tool into a host function of the same name:
+
+```python
+hits = await search_help(query="refund to a closed card", limit=5)
+[(h["id"], h["attributes"].get("title")) for h in hits]
+```
+
+`examples/turbopuffer_search.rs` runs all of this against a live, throwaway namespace.
+
+### Costs and warnings
+
+- Embedding tokens are reported in each write's and query's `performance.embedding_tokens`.
+- Document text and query text go to the model's provider for embedding.
+- The model is fixed per namespace. Changing it means re-ingesting every document into a new namespace.
+- `Namespace::delete_all` deletes the namespace and every document in it. It cannot be undone.
+
+
 ## Code mode
 
 With ordinary tools, every search or classification is a round trip through Claude: the model calls a tool, reads the result, then calls the next one. Code mode replaces that with a single `python` tool. Claude writes one script that fans out many searches and judgments, filters the results in Python and returns only what it needs. The intermediate data never enters Claude's context.
@@ -657,6 +783,7 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `triage` | `classify_all`, `score_all`, `group_by` | `jev` |
 | `reports` | `table`, `to_csv`, `count_by` | |
 | `surreal` | `query`, `tables`, `describe`, `rows`, `one`, `count` | the `surreal` feature |
+| `turbopuffer` | one function per `TurbopufferSearch`, named after it | the `turbopuffer` feature |
 
 `packs::firecrawl` takes your two Firecrawl tools and a credit budget, and gives `search` and `scrape`. Their domain lists, result cap, scrape options and content cut apply as in the tool loop. The budget, `max_credits`, covers the whole conversation and charges real credits, as `FirecrawlBudget` below does: `ScrapeData::credits` for a scrape, a search's `creditsUsed` or the fallback, and a sent request that fails keeps its reservation. Once it is used up, both functions raise `RuntimeError`.
 
@@ -1206,7 +1333,7 @@ The evals binary can also keep its results in SurrealDB; see [evals/README.md](e
 Every call returns `topcoat_si::Result<T>`. An `Error` is `Clone + Send + Sync + 'static` and tells you three things:
 
 - **What failed:** `kind()` returns a `#[non_exhaustive]` `ErrorKind`. Always keep a wildcard arm.
-- **Which service:** `ErrorKind::Api { service, .. }` is `Anthropic`, `Firecrawl` or `Jev`.
+- **Which service:** `ErrorKind::Api { service, .. }` is `Anthropic`, `Firecrawl`, `Jev` or `Turbopuffer`.
 - **Whether sending again might work:** `is_retryable()`.
 
 Other accessors: `request_id()` when a response carried one, `status()` and `retry_after()` for `Api` errors, and `events_delivered()` for errors yielded by a stream. `ErrorKind::Api` also carries `error_type`, Anthropic's `error.type` as an `ErrorType`, and `error_code`, an `ErrorCode`: Anthropic's `error.details.error_code`, Jev's `detail.error_type` or Firecrawl's `code`. The message says what failed and where. The cause is only in `source()`, and decode errors never quote response content. A stream `error` event whose payload has no usable message carries up to 300 bytes of the payload.
@@ -1231,9 +1358,11 @@ A 429 whose `error_code` is `ErrorCode::Anthropic("enforced_spend_limit_reached"
 
 **What the client resends.** Each client sends a request again, up to `with_max_retries` times (Anthropic 3, Firecrawl 2, Jev 2), when the error is retryable, with three exceptions:
 
-- Only GET requests resend `Interrupted`, such as a `download_file` whose body fails. POST and DELETE don't, because the server has already answered. An error status whose body failed to arrive is an `Api` error and is retried normally.
+- Only GET requests resend `Interrupted`, such as a `download_file` whose body fails. Other requests don't, because the server has already answered. An error status whose body failed to arrive is an `Api` error and is retried normally.
 - `Timeout` is resent only by Jev.
 - A `retry-after` over the cap gives up at once: 60 s for Anthropic, 30 s for Firecrawl, and 60 s for Jev, which also gives up when a wait would pass its 30 s retry budget.
+
+turbopuffer requests are retried by turbopuffer's SDK under its own rules; see [Semantic search: turbopuffer](#semantic-search-turbopuffer).
 
 The wait is a backoff that doubles from half a second up to 8 seconds, or the server's `retry-after` when that is longer, so a `retry-after: 0` never resends at once.
 
@@ -1315,6 +1444,7 @@ The tool examples need more keys:
 |---|---|---|
 | `firecrawl_web_search` | web search by hand | `FIRECRAWL_API_KEY` |
 | `claude_tools` | `run_tools` with Firecrawl and Jev | `FIRECRAWL_API_KEY` and the two Jev variables |
+| `turbopuffer_search` | writing, searching and citing a throwaway namespace; run with `--features turbopuffer` | `TURBOPUFFER_API_KEY` and `TURBOPUFFER_REGION` |
 
 The Jev variables are `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`.
 
