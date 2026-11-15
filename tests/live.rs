@@ -69,6 +69,7 @@ async fn every_model_answers() {
         KnownModel::ClaudeOpus55,
         KnownModel::ClaudeSonnet55,
         KnownModel::ClaudeHaiku55,
+        KnownModel::ClaudeFable52,
         KnownModel::ClaudeFable51,
     ] {
         let messages = vec![MessageParam::user(PROMPT)];

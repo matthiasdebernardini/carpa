@@ -159,6 +159,17 @@ pub(crate) struct Logged {
     pub(crate) fields: String,
 }
 
+/// Keeps a second dispatcher registered for the whole test run.
+///
+/// With exactly one live dispatcher, tracing-core computes the interest of a callsite first hit
+/// on another thread from that thread's default alone, so a test without a subscriber can turn
+/// a callsite off for a recording test running at the same time. A second registered dispatcher
+/// makes every callsite ask all of them.
+fn keep_interest_global() {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// Records every event logged on one target.
 struct Events(&'static str, Arc<Mutex<Vec<Logged>>>);
 
@@ -220,6 +231,7 @@ pub(crate) fn unknown_warnings<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
 /// Runs `f` and returns its result with every warning it logged on `target` on this thread,
 /// each as `field=value` pairs.
 pub(crate) fn warnings_on<R>(target: &'static str, f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    keep_interest_global();
     let events = Arc::new(Mutex::new(Vec::new()));
     let result = tracing::subscriber::with_default(Events(target, events.clone()), f);
     let warnings = events
@@ -235,6 +247,7 @@ pub(crate) fn warnings_on<R>(target: &'static str, f: impl FnOnce() -> R) -> (R,
 /// Records the events logged on `target` on this thread until the guard drops. Use it in a
 /// current-thread test so every await stays on this thread.
 pub(crate) fn record_events(target: &'static str) -> (DefaultGuard, Arc<Mutex<Vec<Logged>>>) {
+    keep_interest_global();
     let events = Arc::new(Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(Events(target, events.clone()));
     (guard, events)
@@ -276,9 +289,63 @@ impl tracing::Subscriber for Targets {
 /// Records the targets of the spans and events on this thread until the guard drops. Use it in
 /// a current-thread test so every await stays on this thread.
 pub(crate) fn record_targets() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
+    keep_interest_global();
     let targets = Arc::new(Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(Targets(targets.clone()));
     (guard, targets)
+}
+
+/// Records the name and fields of every span, as `<name> field=value ...`, fields recorded after
+/// creation included.
+struct SpanFields(Arc<Mutex<Vec<String>>>);
+
+/// Appends every field it visits to a line as ` field=value`.
+struct Line<'a>(&'a mut String);
+
+impl field::Visit for Line<'_> {
+    fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+    fn record_str(&mut self, field: &field::Field, value: &str) {
+        self.0.push_str(&format!(" {}={value}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for SpanFields {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
+        let mut line = span.metadata().name().to_string();
+        span.record(&mut Line(&mut line));
+        let mut spans = self.0.lock().unwrap();
+        spans.push(line);
+        span::Id::from_u64(spans.len() as u64)
+    }
+
+    fn record(&self, span: &span::Id, values: &span::Record<'_>) {
+        let mut spans = self.0.lock().unwrap();
+        let index = usize::try_from(span.into_u64() - 1).unwrap();
+        values.record(&mut Line(&mut spans[index]));
+    }
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {}
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+/// Records every span on this thread, with its fields, until the guard drops. Use it in a
+/// current-thread test so every await stays on this thread.
+pub(crate) fn record_span_fields() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
+    keep_interest_global();
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(SpanFields(spans.clone()));
+    (guard, spans)
 }
 
 /// The URL-encoded query string of `pairs`.

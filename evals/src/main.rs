@@ -46,7 +46,7 @@ Options:
   --budget-cents N     Required. Stop before a run once Anthropic spend reaches N cents.
                        Jev judge calls and Firecrawl credits are not counted.
   --models A,B         Models, with or without the claude- prefix. Default: sonnet-5-5.
-                       Known: opus-5-5, sonnet-5-5, haiku-5-5, fable-5-1.
+                       Known: opus-5-5, sonnet-5-5, haiku-5-5, fable-5-2, fable-5-1.
   --repeat N           Runs per case, arm and model. Default: 3.
   --split S            dev, holdout or all. Default: dev.
   --cases ID,ID        Only these case ids. Default: every case in the split.

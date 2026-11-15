@@ -321,6 +321,36 @@ impl Error {
         self.events_delivered
     }
 
+    /// Whether the provider refused the request because the account is out of credit.
+    ///
+    /// True for HTTP 402; for any API error of type [`ErrorType::BillingError`]; for HTTP 429
+    /// with the error code `enforced_spend_limit_reached` (a spend limit was hit); and for HTTP
+    /// 400 `invalid_request_error` whose message starts with "Your credit balance is too low",
+    /// which is how Anthropic answers an empty account in practice.
+    #[must_use]
+    pub fn is_out_of_credit(&self) -> bool {
+        match self.kind.as_ref() {
+            ErrorKind::Api {
+                status: Some(402), ..
+            }
+            | ErrorKind::Api {
+                error_type: Some(ErrorType::BillingError),
+                ..
+            } => true,
+            ErrorKind::Api {
+                status: Some(429),
+                error_code: Some(ErrorCode::Anthropic(code)),
+                ..
+            } => code == "enforced_spend_limit_reached",
+            ErrorKind::Api {
+                status: Some(400),
+                error_type: Some(ErrorType::InvalidRequestError),
+                ..
+            } => self.message.starts_with("Your credit balance is too low"),
+            _ => false,
+        }
+    }
+
     /// Whether sending the same request again might succeed.
     ///
     /// True for [`ErrorKind::Connection`], [`ErrorKind::Timeout`] and
@@ -682,6 +712,53 @@ mod tests {
             None,
         );
         assert!(other_code.is_retryable());
+    }
+
+    #[test]
+    fn out_of_credit_signals() {
+        let api = |status: u16, error_type: ErrorType, message: &str, code: Option<&str>| {
+            Error::http_status(
+                Service::Anthropic,
+                status,
+                Some(message.to_string()),
+                Some(error_type),
+                code.map(|code| ErrorCode::Anthropic(code.to_string())),
+                None,
+                None,
+            )
+        };
+        let low_balance = "Your credit balance is too low to access the Anthropic API.";
+        assert!(http(402).is_out_of_credit());
+        assert!(api(403, ErrorType::BillingError, "billing", None).is_out_of_credit());
+        assert!(stream_event(Some(ErrorType::BillingError), None).is_out_of_credit());
+        assert!(
+            api(
+                429,
+                ErrorType::RateLimitError,
+                "spend",
+                Some("enforced_spend_limit_reached")
+            )
+            .is_out_of_credit()
+        );
+        assert!(api(400, ErrorType::InvalidRequestError, low_balance, None).is_out_of_credit());
+
+        assert!(
+            !api(
+                429,
+                ErrorType::RateLimitError,
+                "slow",
+                Some("something_else")
+            )
+            .is_out_of_credit()
+        );
+        assert!(!api(400, ErrorType::InvalidRequestError, "bad field", None).is_out_of_credit());
+        assert!(!api(400, ErrorType::ApiError, low_balance, None).is_out_of_credit());
+        assert!(!api(500, ErrorType::InvalidRequestError, low_balance, None).is_out_of_credit());
+        for status in [400, 401, 403, 429, 500, 529] {
+            assert!(!http(status).is_out_of_credit(), "{status}");
+        }
+        assert!(!Error::new(ErrorKind::Connection, "down").is_out_of_credit());
+        assert!(!stream_event(Some(ErrorType::ApiError), None).is_out_of_credit());
     }
 
     #[test]

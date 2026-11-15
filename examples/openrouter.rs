@@ -12,11 +12,11 @@ use std::env;
 
 use carpa::jev::{JevClient, Outcome, Questions};
 use carpa::{
-    Anthropic, ContentBlock, MessageCreateParams, Model, OpenRouterSearchEngine,
+    Anthropic, ContentBlock, KnownModel, MessageCreateParams, OpenRouterSearchEngine,
     OpenRouterWebSearchTool, ToolUnionParam,
 };
 
-const CLAUDE: &str = "anthropic/claude-haiku-5.5";
+const CLAUDE: KnownModel = KnownModel::ClaudeHaiku55;
 const JEV: &str = "typesafe/jev-1.14";
 // `pause_turn` replies resend the turn; stop a search that keeps going.
 const MAX_TURNS: u32 = 3;
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let claude = Anthropic::openrouter(&key)?;
     let params = MessageCreateParams::simple(
         "What is the latest stable Rust release? Answer in two sentences and cite a source.",
-        Model::Custom(CLAUDE.to_string()),
+        CLAUDE,
     )
     .with_tools(vec![ToolUnionParam::OpenRouterWebSearch(search)]);
     // No client tools: OpenRouter runs every search itself.

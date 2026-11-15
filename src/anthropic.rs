@@ -5,7 +5,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,15 +29,16 @@ use crate::observability;
 use crate::sse::process_message_stream_sse;
 use crate::types::{
     CompactionRequest, ContextManagement, CostReport, CostReportParams, DeletedFile,
-    DeletedMessageBatch, ErrorType, FileInfo, FileList, FileListParams, McpServer, Message,
-    MessageBatch, MessageBatchCreateParams, MessageBatchListParams, MessageBatchListResponse,
-    MessageBatchResult, MessageCountTokensParams, MessageCreateParams, MessageStreamEvent,
-    MessageTokensCount, Model, ModelInfo, ModelListParams, ModelListResponse, OutputConfig,
-    RateLimits, ToolUnionParam, Usage, UsageReport, UsageReportParams, retry_after_from_headers,
+    DeletedMessageBatch, ErrorType, FileInfo, FileList, FileListParams, KnownModel, McpServer,
+    Message, MessageBatch, MessageBatchCreateParams, MessageBatchListParams,
+    MessageBatchListResponse, MessageBatchResult, MessageCountTokensParams, MessageCreateParams,
+    MessageStreamEvent, MessageTokensCount, Model, ModelInfo, ModelListParams, ModelListResponse,
+    OutputConfig, RateLimits, ToolUnionParam, Usage, UsageReport, UsageReportParams,
+    retry_after_from_headers,
 };
 
-fn final_failure(error: &Error) {
-    let span = Span::current();
+/// Marks `span` failed with `error`'s request id and status, without logging it.
+fn mark_failed(span: &Span, error: &Error) {
     span.record("otel.status_code", "ERROR");
     if let Some(id) = error.request_id() {
         span.record("request_id", id);
@@ -45,6 +46,11 @@ fn final_failure(error: &Error) {
     if let Some(status) = error.status() {
         span.record("http.status_code", status);
     }
+}
+
+/// Marks `span` failed and logs `error`.
+fn final_failure(span: &Span, error: &Error) {
+    mark_failed(span, error);
     tracing::error!(
         target: "carpa::client",
         error = error as &dyn std::error::Error,
@@ -106,7 +112,7 @@ where
         let item = async {
             let item = inner.next().await;
             if let Some(Err(error)) = &item {
-                final_failure(error);
+                final_failure(&span, error);
             }
             item
         }
@@ -496,18 +502,25 @@ pub struct Anthropic {
     cached_headers: HeaderMap,
     /// Beta feature headers included on every request.
     default_betas: Vec<String>,
-    /// Rate-limit headers from the most recent response, shared by clones.
+    /// Rate-limit headers from the most recent response, shared by clones and fallbacks.
     last_rate_limits: Arc<Mutex<Option<RateLimits>>>,
+    /// Providers Messages requests move to, in order, once the one before is out of credit.
+    fallbacks: Arc<[Anthropic]>,
+    /// The provider Messages requests go to: 0 is this client, `n` is `fallbacks[n - 1]`.
+    /// Shared by clones made since the last [`Anthropic::with_fallbacks`]; it only moves forward.
+    active: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for Anthropic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Anthropic")
             .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
             .field("cached_headers", &"[REDACTED]")
             .field("timeout", &self.timeout)
             .field("read_timeout", &self.stream_read_timeout())
             .field("max_retries", &self.max_retries)
+            .field("fallbacks", &self.fallbacks)
             .finish_non_exhaustive()
     }
 }
@@ -591,9 +604,9 @@ impl Anthropic {
     /// Create a client for OpenRouter's Anthropic-compatible Messages endpoint.
     ///
     /// Requests go to `https://openrouter.ai/api/v1/messages` with the OpenRouter key as
-    /// `Authorization: Bearer`. Name models by OpenRouter slug, such as
-    /// `Model::Custom("anthropic/claude-sonnet-5.5".into())`. A key of the form `file:///path`
-    /// is read from that file. The base URL environment variables are not read.
+    /// `Authorization: Bearer`. A [`Model::Known`] model is sent under its OpenRouter name, such
+    /// as `anthropic/claude-sonnet-5.5`; a [`Model::Custom`] name is sent as written. A key of
+    /// the form `file:///path` is read from that file. The base URL environment variables are not read.
     pub fn openrouter(api_key: &str) -> Result<Self> {
         Self::with_key_and_base_url(api_key, OPENROUTER_BASE_URL.to_string())
     }
@@ -651,6 +664,8 @@ impl Anthropic {
             cached_headers,
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
+            fallbacks: Arc::from([]),
+            active: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -742,6 +757,66 @@ impl Anthropic {
     ) -> Self {
         self.default_betas = betas.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Add providers that Messages requests move to when the current one is out of credit.
+    ///
+    /// Order is priority: this client first, then `providers` in order; calling it again
+    /// appends. Each provider keeps its own key, base URL, headers, timeouts, retries and betas,
+    /// and a provider's own fallbacks follow it in the list. When a `send` or `stream` fails
+    /// with [`Error::is_out_of_credit`], the same request is resent on the next provider, and
+    /// the client stays there until the process restarts. When the last provider is out of
+    /// credit too, its error is returned.
+    ///
+    /// The call starts a new provider position at this client. Clones made after it share that
+    /// position and move together; clones made before it keep their own. An empty `providers`
+    /// changes nothing.
+    ///
+    /// The switch is final. OpenRouter also answers 402 when one request needs more credit than
+    /// is left, though smaller requests could still pass; the client switches then too and does
+    /// not come back.
+    ///
+    /// Only Messages requests move. Batches, files, models, usage and cost reports and
+    /// `count_tokens` always go to this client, since batch and file ids belong to one account.
+    /// Name models with [`Model::Known`] so each provider gets its own spelling.
+    #[must_use]
+    pub fn with_fallbacks(mut self, providers: impl IntoIterator<Item = Anthropic>) -> Self {
+        let mut fallbacks = self.fallbacks.to_vec();
+        let configured = fallbacks.len();
+        for mut provider in providers {
+            let nested = std::mem::replace(&mut provider.fallbacks, Arc::from([]));
+            for mut provider in std::iter::once(provider).chain(nested.iter().cloned()) {
+                provider.last_rate_limits = Arc::clone(&self.last_rate_limits);
+                fallbacks.push(provider);
+            }
+        }
+        if fallbacks.len() == configured {
+            return self;
+        }
+        self.fallbacks = fallbacks.into();
+        self.active = Arc::new(AtomicUsize::new(0));
+        let providers: Vec<&str> = std::iter::once(&self)
+            .chain(self.fallbacks.iter())
+            .map(|provider| provider.base_url.as_str())
+            .collect();
+        observability::providers_configured(&providers);
+        self
+    }
+
+    /// The base URL Messages requests currently go to: this client's, or a fallback's after
+    /// a switch (see [`Self::with_fallbacks`]).
+    #[must_use]
+    pub fn active_base_url(&self) -> &str {
+        &self.provider(self.active.load(Ordering::Acquire)).base_url
+    }
+
+    /// The provider at `position`: 0 is this client, `n` is the `n`th fallback. The position
+    /// never passes the last fallback, so an index out of range is a bug and panics.
+    fn provider(&self, position: usize) -> &Anthropic {
+        match position.checked_sub(1) {
+            None => self,
+            Some(index) => &self.fallbacks[index],
+        }
     }
 
     /// Build default headers for API requests (static method for initialization).
@@ -853,31 +928,114 @@ impl Anthropic {
 
     /// Sends `call` under the shared retry loop and reads each successful response with `read`.
     ///
-    /// The call runs in its `carpa.request` span, and its outcome, a failure found before
-    /// sending included, is reported once: the `request_completed` event and, on failure, the
-    /// error log. Only GET requests resend an [`ErrorKind::Interrupted`] failure, since the server
-    /// has already answered a POST or DELETE.
-    async fn execute<T, Read, Fut>(&self, call: Call<'_>, read: Read) -> Result<T>
+    /// A Messages request goes to the active provider; when that provider is out of credit, the
+    /// shared position moves to the next provider and the request is resent there (see
+    /// [`Anthropic::with_fallbacks`]). Every other call goes to this client. Only GET requests
+    /// resend an [`ErrorKind::Interrupted`] failure, since the server has already answered a POST
+    /// or DELETE.
+    async fn execute<T, Read, Fut>(&self, mut call: Call<'_>, read: Read) -> Result<T>
     where
         Read: Fn(Response) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
+        let mut check = std::mem::replace(&mut call.check, Ok(()));
+        let provider_count = self.fallbacks.len() + 1;
+        let mut position = if call.message {
+            self.active.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        loop {
+            let fails_over = call.message && position + 1 < provider_count;
+            let check = std::mem::replace(&mut check, Ok(()));
+            let error = match self
+                .execute_on(position, &call, check, &read, fails_over)
+                .await
+            {
+                Err(error) if call.message && error.is_out_of_credit() => error,
+                result => return result,
+            };
+            let from = self.provider(position);
+            if !fails_over {
+                if provider_count > 1 {
+                    observability::providers_exhausted(
+                        call.operation,
+                        &from.base_url,
+                        provider_count,
+                        error.status(),
+                    );
+                }
+                return Err(error);
+            }
+            let next = position + 1;
+            // Concurrent requests out of credit on the same provider move it one step.
+            let previous = self.active.fetch_max(next, Ordering::AcqRel);
+            let to_index = previous.max(next);
+            let switch = observability::ProviderSwitch {
+                operation: call.operation,
+                from: &from.base_url,
+                to: &self.provider(to_index).base_url,
+                from_index: position,
+                to_index,
+                provider_count,
+                error: &error,
+            };
+            if previous < next {
+                switch.switched();
+            } else {
+                switch.already_switched();
+            }
+            position = to_index;
+        }
+    }
+
+    /// Sends `call` to the provider at `position` in its own `carpa.request` span, unless
+    /// `check` failed it already, and reports its outcome once: the `request_completed` event
+    /// and, on failure, the error log. An out-of-credit failure that `fails_over` to the next
+    /// provider marks the span failed but is not logged as an error; the switch event tells it.
+    async fn execute_on<T, Read, Fut>(
+        &self,
+        position: usize,
+        call: &Call<'_>,
+        check: Result<()>,
+        read: &Read,
+        fails_over: bool,
+    ) -> Result<T>
+    where
+        Read: Fn(Response) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let provider = self.provider(position);
         let span = tracing::info_span!(
             target: "carpa::client",
             "carpa.request",
             operation = call.operation,
             otel.kind = "client", gen_ai.request.model = call.model.map(field::display),
             stream = call.stream,
+            provider = %provider.base_url,
+            provider_index = field::Empty, provider_count = field::Empty,
             request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
             input_tokens = field::Empty, output_tokens = field::Empty,
             otel.status_code = field::Empty, cache_read_input_tokens = field::Empty,
             cache_creation_input_tokens = field::Empty, cost_micro_cents = field::Empty
         );
+        if !self.fallbacks.is_empty() {
+            span.record("provider_index", position);
+            span.record("provider_count", self.fallbacks.len() + 1);
+        }
+        let reported = span.clone();
         async {
             let start = Instant::now();
-            let result = self.send_with_retries(call, read).await;
-            if let Err(error) = &result {
-                final_failure(error);
+            let result = match check {
+                Ok(()) => provider.send_with_retries(call, read).await,
+                Err(error) => Err(error),
+            };
+            match &result {
+                Err(error) if fails_over && error.is_out_of_credit() => {
+                    mark_failed(&reported, error);
+                }
+                Err(error) => final_failure(&reported, error),
+                Ok(_) => {}
             }
             observability::request_completed(start.elapsed(), result.is_ok());
             result
@@ -886,8 +1044,9 @@ impl Anthropic {
         .await
     }
 
-    /// The body of [`Anthropic::execute`] without its reporting.
-    async fn send_with_retries<T, Read, Fut>(&self, call: Call<'_>, read: Read) -> Result<T>
+    /// Sends a checked `call` to this client under the shared retry loop and reads each
+    /// successful response with `read`.
+    async fn send_with_retries<T, Read, Fut>(&self, call: &Call<'_>, read: &Read) -> Result<T>
     where
         Read: Fn(Response) -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -896,24 +1055,22 @@ impl Anthropic {
             method,
             path,
             query,
-            body,
             content_type,
             accept,
             mode,
             betas,
             auto_betas,
-            check,
             ..
         } = call;
-        check?;
-        let betas = self.collect_betas(Some(&betas), &auto_betas);
+        let body = message_body(&self.base_url, call)?;
+        let betas = self.collect_betas(Some(betas), auto_betas);
         let mut headers = self
             .headers_with_betas(&betas)?
             .unwrap_or_else(|| self.default_headers());
         if let Some(accept) = accept {
             headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
         }
-        match &content_type {
+        match content_type {
             Some(content_type) => {
                 let value = HeaderValue::from_str(content_type).map_err(|error| {
                     Error::validation("Invalid content type", Some("content_type".to_string()))
@@ -942,7 +1099,7 @@ impl Anthropic {
             resend_timeouts: false,
             resend_interrupted: method == Method::GET,
         };
-        let (method, url, headers, body, read) = (&method, &url, &headers, &body, &read);
+        let (url, headers, body) = (&url, &headers, &body);
         let retried = backoff::retry(
             &policy,
             |_, _| async move {
@@ -1465,6 +1622,30 @@ fn path_id(param: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The body to send `call` with to the provider at `base_url`: a Messages request with a
+/// [`Model::Known`] model sent to OpenRouter gets the model's OpenRouter name; every other body
+/// goes as built.
+fn message_body(base_url: &str, call: &Call<'_>) -> Result<Option<Bytes>> {
+    match (&call.body, call.model) {
+        (Some(body), Some(Model::Known(known))) if call.message && is_openrouter(base_url) => {
+            with_openrouter_model(body, *known).map(Some)
+        }
+        (body, _) => Ok(body.clone()),
+    }
+}
+
+/// `body`, the JSON body of a Messages request, with its top-level `model` replaced by
+/// `model`'s OpenRouter name; other fields keep their order.
+fn with_openrouter_model(body: &[u8], model: KnownModel) -> Result<Bytes> {
+    let failed = |error| {
+        Error::validation("Failed to rename the model for OpenRouter", None).with_source(error)
+    };
+    let mut fields: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(body).map_err(failed)?;
+    fields.insert("model".to_string(), model.openrouter_slug().into());
+    serde_json::to_vec(&fields).map(Bytes::from).map_err(failed)
+}
+
 /// One API call for [`Anthropic::execute`]: what to send and how its span is labelled.
 struct Call<'a> {
     /// The span's `operation` field: the name of the public method.
@@ -1490,6 +1671,9 @@ struct Call<'a> {
     auto_betas: Vec<&'static str>,
     /// A failure found before sending, reported like any other failure.
     check: Result<()>,
+    /// A Messages request: it may move to a fallback provider, and an OpenRouter provider gets
+    /// a known model under its OpenRouter name.
+    message: bool,
 }
 
 impl<'a> Call<'a> {
@@ -1508,6 +1692,7 @@ impl<'a> Call<'a> {
             betas: Vec::new(),
             auto_betas: Vec::new(),
             check: Ok(()),
+            message: false,
         }
     }
 
@@ -1518,6 +1703,7 @@ impl<'a> Call<'a> {
             betas: params.betas.clone().unwrap_or_default(),
             auto_betas: message_betas(params),
             check: params.validate(),
+            message: true,
             ..Self::new(operation, Method::POST, &["messages"])
         }
         .with_json(params)
@@ -3605,5 +3791,478 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
             .filter(|e| e.message == "request_completed")
             .count();
         assert_eq!(completed, 1, "{events:?}");
+    }
+
+    const OUT_OF_CREDIT: &str =
+        r#"{"type":"error","error":{"type":"billing_error","message":"Out of credit"}}"#;
+
+    /// A client on `base_url` that never retries and uses `key`.
+    fn provider(base_url: &str, key: &str) -> Anthropic {
+        Anthropic::try_new(Some(key.to_string()))
+            .unwrap()
+            .with_base_url(base_url.to_string())
+            .unwrap()
+            .with_max_retries(0)
+    }
+
+    #[tokio::test]
+    async fn out_of_credit_moves_to_the_next_provider_and_stays() {
+        let (first, first_requests) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, second_requests) = serve(vec![
+            Canned::json(200, reply_json()),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+        assert_eq!(client.active_base_url(), first);
+
+        assert_eq!(client.send(&send_params()).await.unwrap().id, "msg_1");
+        assert_eq!(client.active_base_url(), second);
+        client.send(&send_params()).await.unwrap();
+
+        assert_eq!(first_requests.lock().unwrap().len(), 1);
+        let second_requests = second_requests.lock().unwrap();
+        assert_eq!(second_requests.len(), 2);
+        assert_eq!(header(&second_requests[0], "x-api-key"), Some("key_b"));
+        assert_eq!(
+            first_requests.lock().unwrap()[0].body,
+            second_requests[0].body,
+            "the same request is resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_spend_limit_moves_to_the_next_provider() {
+        let spend_limit = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}"#;
+        let (first, _) = serve(vec![Canned::json(429, spend_limit)]).await;
+        let (second, _) = serve(vec![Canned::json(200, reply_json())]).await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+
+        client.send(&send_params()).await.unwrap();
+        assert_eq!(client.active_base_url(), second);
+    }
+
+    #[tokio::test]
+    async fn fallbacks_are_tried_in_order_and_flattened() {
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, second_requests) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (third, third_requests) = serve(vec![Canned::json(200, reply_json())]).await;
+        let nested = provider(&second, "key_b").with_fallbacks([provider(&third, "key_c")]);
+        let client = provider(&first, "key_a").with_fallbacks([nested]);
+
+        client.send(&send_params()).await.unwrap();
+        assert_eq!(client.active_base_url(), third);
+        assert_eq!(second_requests.lock().unwrap().len(), 1);
+        assert_eq!(third_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn when_every_provider_is_out_of_credit_the_last_error_returns() {
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+        let (guard, events) = record_events("carpa::client");
+        let error = client.send(&send_params()).await.unwrap_err();
+        drop(guard);
+
+        assert_eq!(error.status(), Some(402));
+        assert_eq!(client.active_base_url(), second);
+        let events = events.lock().unwrap();
+        let exhausted: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "providers_exhausted")
+            .collect();
+        assert_eq!(exhausted.len(), 1, "{events:?}");
+        assert_eq!(exhausted[0].level, tracing::Level::ERROR);
+        assert_eq!(
+            exhausted[0].fields,
+            format!("operation=send provider={second} provider_count=2 http.status_code=402"),
+        );
+        let errors = events
+            .iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .count();
+        assert_eq!(
+            errors, 2,
+            "one failure line and one exhausted line: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_errors_do_not_switch() {
+        let overloaded = r#"{"type":"error","error":{"type":"api_error","message":"down"}}"#;
+        let bad = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+        for (status, body) in [(500, overloaded), (400, bad)] {
+            let (first, _) = serve(vec![Canned::json(status, body)]).await;
+            let (second, second_requests) = serve(vec![Canned::json(200, reply_json())]).await;
+            let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+
+            let error = client.send(&send_params()).await.unwrap_err();
+            assert_eq!(error.status(), Some(status));
+            assert_eq!(client.active_base_url(), first);
+            assert!(second_requests.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clone_made_before_the_switch_follows_it() {
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, second_requests) = serve(vec![
+            Canned::json(200, reply_json()),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+        let earlier = client.clone();
+
+        client.send(&send_params()).await.unwrap();
+        assert_eq!(earlier.active_base_url(), second);
+        earlier.send(&send_params()).await.unwrap();
+        assert_eq!(second_requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_moves_to_the_next_provider() {
+        let events = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, second_requests) = serve(vec![
+            Canned::json(200, events).with_content_type("text/event-stream"),
+        ])
+        .await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+
+        let stream = client.stream(&streaming_params()).await.unwrap();
+        let items = stream.collect::<Vec<_>>().await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(client.active_base_url(), second);
+        assert_eq!(second_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_credit_without_fallbacks_returns_the_error() {
+        let (base_url, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let client = provider(&base_url, "key_a");
+        let (guard, events) = record_events("carpa::client");
+        let error = client.send(&send_params()).await.unwrap_err();
+        drop(guard);
+
+        assert!(error.is_out_of_credit());
+        assert_eq!(client.active_base_url(), base_url);
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().all(|e| !e.message.starts_with("provider")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_message_requests_switch() {
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, second_requests) = serve(vec![Canned::json(200, "{}")]).await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+
+        let params = MessageCountTokensParams::new(
+            vec![MessageParam::user("hi")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+        let error = client.count_tokens(params).await.unwrap_err();
+        assert_eq!(error.status(), Some(402));
+        assert_eq!(client.active_base_url(), first);
+        assert!(second_requests.lock().unwrap().is_empty());
+    }
+
+    /// Two providers: the first answers 402 with request id `req_402`, the second 200.
+    async fn switching_pair() -> (String, String, Anthropic) {
+        let (first, _) = serve(vec![
+            Canned::json(402, OUT_OF_CREDIT).with_header("request-id", "req_402"),
+        ])
+        .await;
+        let (second, _) = serve(vec![Canned::json(200, reply_json())]).await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+        (first, second, client)
+    }
+
+    /// Whether the recorded span line has the field `field=value`.
+    fn has_field(span: &str, field: &str) -> bool {
+        span.split(' ').any(|recorded| recorded == field)
+    }
+
+    #[tokio::test]
+    async fn a_switch_logs_one_provider_switch_event() {
+        let (first, second, client) = switching_pair().await;
+        let (guard, events) = record_events("carpa::client");
+        client.send(&send_params()).await.unwrap();
+        drop(guard);
+
+        let events = events.lock().unwrap();
+        let switches: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "provider_switch")
+            .collect();
+        assert_eq!(switches.len(), 1, "{events:?}");
+        assert_eq!(switches[0].level, tracing::Level::WARN);
+        assert_eq!(
+            switches[0].fields,
+            format!(
+                "operation=send from={first} to={second} from_index=0 to_index=1 \
+                 provider_count=2 reason=out_of_credit http.status_code=402 request_id=req_402"
+            ),
+        );
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "request_completed")
+            .map(|e| e.fields.ends_with("ok=true"))
+            .collect();
+        assert_eq!(completed, [false, true], "{events:?}");
+        assert!(
+            events.iter().all(|e| e.level != tracing::Level::ERROR),
+            "a request that failed over is not an error: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_has_one_span_per_provider() {
+        let (first, second, client) = switching_pair().await;
+        let (guard, spans) = crate::test_support::record_span_fields();
+        client.send(&send_params()).await.unwrap();
+        drop(guard);
+
+        let spans = spans.lock().unwrap();
+        let requests: Vec<_> = spans
+            .iter()
+            .filter(|span| span.starts_with("carpa.request "))
+            .collect();
+        assert_eq!(requests.len(), 2, "{spans:?}");
+        for field in [
+            format!("provider={first}"),
+            "provider_index=0".to_string(),
+            "provider_count=2".to_string(),
+            "http.status_code=402".to_string(),
+            "otel.status_code=ERROR".to_string(),
+        ] {
+            assert!(has_field(requests[0], &field), "{field}: {requests:?}");
+        }
+        for field in [
+            format!("provider={second}"),
+            "provider_index=1".to_string(),
+            "provider_count=2".to_string(),
+        ] {
+            assert!(has_field(requests[1], &field), "{field}: {requests:?}");
+        }
+        assert!(!requests[1].contains("otel.status_code"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn a_request_span_names_its_provider_without_fallbacks() {
+        let (base_url, _) = serve(vec![Canned::json(200, reply_json())]).await;
+        let client = provider(&base_url, "key_a");
+        let (guard, spans) = crate::test_support::record_span_fields();
+        client.send(&send_params()).await.unwrap();
+        drop(guard);
+
+        let spans = spans.lock().unwrap();
+        assert!(
+            has_field(&spans[0], &format!("provider={base_url}")),
+            "{spans:?}"
+        );
+        assert!(!spans[0].contains("provider_index"), "{spans:?}");
+    }
+
+    #[tokio::test]
+    async fn keys_never_reach_the_logs_or_debug() {
+        let (first, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (second, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (guard, events) = record_events("carpa::client");
+        let client = provider(&first, "sk-first-secret")
+            .with_fallbacks([provider(&second, "sk-second-secret")]);
+        let _ = client.send(&send_params()).await.unwrap_err();
+        drop(guard);
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.message == "providers_configured"),
+            "{events:?}"
+        );
+        let logged = format!("{events:?} {client:?}");
+        for key in ["sk-first-secret", "sk-second-secret"] {
+            assert!(!logged.contains(key), "{logged}");
+        }
+    }
+
+    #[test]
+    fn providers_configured_lists_the_providers_in_order() {
+        let (guard, events) = record_events("carpa::client");
+        let _client = provider("http://127.0.0.1:1", "key_a").with_fallbacks([
+            provider("http://127.0.0.1:2", "key_b"),
+            provider("http://127.0.0.1:3", "key_c"),
+        ]);
+        drop(guard);
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].level, tracing::Level::INFO);
+        assert_eq!(events[0].message, "providers_configured");
+        assert_eq!(
+            events[0].fields,
+            "providers=http://127.0.0.1:1, http://127.0.0.1:2, http://127.0.0.1:3 provider_count=3"
+        );
+    }
+
+    #[test]
+    fn openrouter_model_rename_keeps_the_rest_of_the_body() {
+        let params = send_params().with_stream(false);
+        let body = serde_json::to_vec(&params).unwrap();
+
+        let renamed = with_openrouter_model(&body, KnownModel::ClaudeSonnet55).unwrap();
+        let mut expected: serde_json::Map<String, Value> = serde_json::from_slice(&body).unwrap();
+        expected.insert("model".to_string(), "anthropic/claude-sonnet-5.5".into());
+        assert_eq!(renamed, serde_json::to_vec(&expected).unwrap());
+        let keys = |body: &[u8]| -> Vec<String> {
+            serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(keys(&body), keys(&renamed));
+    }
+
+    #[test]
+    fn only_known_models_on_openrouter_messages_are_renamed() {
+        const OPENROUTER: &str = "https://openrouter.ai/api";
+        let model_of = |body: Option<Bytes>| -> Value {
+            serde_json::from_slice::<Value>(&body.unwrap()).unwrap()["model"].clone()
+        };
+        let known = send_params();
+        let message = Call::message("send", &known);
+        assert_eq!(
+            model_of(message_body(OPENROUTER, &message).unwrap()),
+            "anthropic/claude-haiku-5.5"
+        );
+        assert_eq!(
+            model_of(message_body("https://api.anthropic.com", &message).unwrap()),
+            "claude-haiku-5-5"
+        );
+
+        let count = MessageCountTokensParams::new(
+            vec![MessageParam::user("hi")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+        let count_call = Call {
+            model: Some(&count.model),
+            ..Call::new("count_tokens", Method::POST, &["messages", "count_tokens"])
+        }
+        .with_json(&count);
+        assert_eq!(
+            model_of(message_body(OPENROUTER, &count_call).unwrap()),
+            "claude-haiku-5-5"
+        );
+
+        let custom = MessageCreateParams::new(
+            16,
+            vec![MessageParam::user("hi")],
+            Model::Custom("anthropic/claude-haiku-5.5-20261007".to_string()),
+        );
+        assert_eq!(
+            model_of(message_body(OPENROUTER, &Call::message("send", &custom)).unwrap()),
+            "anthropic/claude-haiku-5.5-20261007"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_credit_balance_400_moves_to_the_next_provider() {
+        let low_balance = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        let (first, _) = serve(vec![Canned::json(400, low_balance)]).await;
+        let (second, second_requests) = serve(vec![Canned::json(200, reply_json())]).await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+
+        client.send(&send_params()).await.unwrap();
+        assert_eq!(client.active_base_url(), second);
+        assert_eq!(second_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clones_given_different_fallbacks_keep_their_own_position() {
+        let (a, a_requests) = serve(vec![
+            Canned::json(402, OUT_OF_CREDIT),
+            Canned::json(402, OUT_OF_CREDIT),
+        ])
+        .await;
+        let (b, _) = serve(vec![Canned::json(402, OUT_OF_CREDIT)]).await;
+        let (c, _) = serve(vec![Canned::json(200, reply_json())]).await;
+        let (d, d_requests) = serve(vec![Canned::json(200, reply_json())]).await;
+        let base = provider(&a, "key_a");
+        let x = base
+            .clone()
+            .with_fallbacks([provider(&b, "key_b"), provider(&c, "key_c")]);
+        let y = base.clone().with_fallbacks([provider(&d, "key_d")]);
+
+        x.send(&send_params()).await.unwrap();
+        assert_eq!(x.active_base_url(), c);
+        assert_eq!(y.active_base_url(), a);
+        assert_eq!(base.active_base_url(), a);
+
+        y.send(&send_params()).await.unwrap();
+        assert_eq!(y.active_base_url(), d);
+        assert_eq!(a_requests.lock().unwrap().len(), 2);
+        assert_eq!(d_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_fallbacks_change_nothing() {
+        let client = provider("http://127.0.0.1:1", "key_a");
+        let (guard, events) = record_events("carpa::client");
+        let same = client.clone().with_fallbacks([]);
+        drop(guard);
+
+        assert!(events.lock().unwrap().is_empty());
+        assert!(same.fallbacks.is_empty());
+        assert!(Arc::ptr_eq(&same.active, &client.active));
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_out_of_credit_switch_once() {
+        // The server answers one connection at a time, so both requests are sent, and both
+        // start on the first provider, before either answer is read.
+        let (first, first_requests) = serve(vec![
+            Canned::json(402, OUT_OF_CREDIT),
+            Canned::json(402, OUT_OF_CREDIT),
+        ])
+        .await;
+        let (second, second_requests) = serve(vec![
+            Canned::json(200, reply_json()),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let client = provider(&first, "key_a").with_fallbacks([provider(&second, "key_b")]);
+        let params = send_params();
+        let (guard, events) = record_events("carpa::client");
+        let (one, two) = tokio::join!(client.send(&params), client.send(&params));
+        drop(guard);
+
+        assert_eq!(one.unwrap().id, "msg_1");
+        assert_eq!(two.unwrap().id, "msg_1");
+        assert_eq!(first_requests.lock().unwrap().len(), 2);
+        assert_eq!(second_requests.lock().unwrap().len(), 2);
+        let events = events.lock().unwrap();
+        let count = |message: &str| events.iter().filter(|e| e.message == message).count();
+        assert_eq!(count("provider_switch"), 1, "{events:?}");
+        assert_eq!(count("provider_already_switched"), 1, "{events:?}");
+        let already = events
+            .iter()
+            .find(|e| e.message == "provider_already_switched")
+            .unwrap();
+        assert_eq!(already.level, tracing::Level::DEBUG);
+        assert!(
+            already.fields.starts_with(&format!(
+                "operation=send from={first} to={second} from_index=0 to_index=1"
+            )),
+            "{already:?}"
+        );
     }
 }

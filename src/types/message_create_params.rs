@@ -143,7 +143,7 @@ pub struct MessageCreateParams {
 
     /// Inference speed for this request.
     ///
-    /// Fast mode is generally available on Opus 5.5 and needs no beta header. It
+    /// Fast mode is generally available on Opus 5.5 and Fable 5.2 and needs no beta header. It
     /// is not allowed in Message Batches; batch validation rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<InferenceSpeed>,

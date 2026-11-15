@@ -108,6 +108,7 @@ A base URL must use https. Plain http is accepted only for a loopback host (`loc
 | `ClaudeOpus55` | Claude Opus 5.5 |
 | `ClaudeSonnet55` | Claude Sonnet 5.5 |
 | `ClaudeHaiku55` | Claude Haiku 5.5 |
+| `ClaudeFable52` | Claude Fable 5.2 |
 | `ClaudeFable51` | Claude Fable 5.1 |
 
 Parsing a `Model` never fails. A known ID becomes `Model::Known`, and any other ID becomes `Model::Custom`:
@@ -560,7 +561,7 @@ Problems the model or a retry can fix, such as bad input, 429, 5xx or a timeout,
 
 One [OpenRouter](https://openrouter.ai) key can route both Claude and Jev through OpenRouter, billed to the OpenRouter account.
 
-`Anthropic::openrouter(key)` sends Messages requests to `https://openrouter.ai/api/v1/messages` with the key as `Authorization: Bearer`. Name the model by its OpenRouter slug through `Model::Custom`, such as `anthropic/claude-sonnet-5.5`. From the environment, set `CARPA_BASE_URL=https://openrouter.ai/api` and `OPENROUTER_API_KEY`; for a base URL on `openrouter.ai` or a subdomain such as `eu.openrouter.ai`, `Anthropic::try_new(None)` reads `CARPA_API_KEY` or `OPENROUTER_API_KEY` and never `ANTHROPIC_API_KEY`. Carpa's own price tables do not cover OpenRouter slugs.
+`Anthropic::openrouter(key)` sends Messages requests to `https://openrouter.ai/api/v1/messages` with the key as `Authorization: Bearer`. Name the model with `KnownModel`, as for Anthropic: `KnownModel::ClaudeSonnet55` goes out under its OpenRouter name, `anthropic/claude-sonnet-5.5`. From the environment, set `CARPA_BASE_URL=https://openrouter.ai/api` and `OPENROUTER_API_KEY`; for a base URL on `openrouter.ai` or a subdomain such as `eu.openrouter.ai`, `Anthropic::try_new(None)` reads `CARPA_API_KEY` or `OPENROUTER_API_KEY` and never `ANTHROPIC_API_KEY`. Known models are priced as usual, since OpenRouter charges Anthropic's list prices for them. A `Model::Custom` name is sent as written and is not priced.
 
 `JevClient::openrouter(key, model)` sends Jev requests to `https://openrouter.ai/api/v1/systemone`. Pin an OpenRouter ID such as `typesafe/jev-1.14` or `typesafe/jev-1.13`; `~typesafe/jev-latest` moves. `JevResponse::cost` holds the charge in USD.
 
@@ -575,7 +576,7 @@ The `firecrawl` engine uses OpenRouter's Firecrawl key, so it needs no Firecrawl
 
 ```rust,no_run
 use carpa::{
-    Anthropic, MessageCreateParams, Model, OpenRouterFetchEngine, OpenRouterSearchEngine,
+    Anthropic, KnownModel, MessageCreateParams, OpenRouterFetchEngine, OpenRouterSearchEngine,
     OpenRouterWebFetchTool, OpenRouterWebSearchTool, ToolUnionParam,
 };
 use carpa::jev::JevClient;
@@ -584,7 +585,7 @@ async fn ask(key: &str) -> Result<(), Box<dyn std::error::Error>> {
     let claude = Anthropic::openrouter(key)?;
     let params = MessageCreateParams::simple(
         "What changed in the latest Rust release? Cite a source.",
-        Model::Custom("anthropic/claude-sonnet-5.5".to_string()),
+        KnownModel::ClaudeSonnet55,
     )
     .with_tools(vec![
         ToolUnionParam::OpenRouterWebSearch(
@@ -609,6 +610,34 @@ async fn ask(key: &str) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Two caveats. OpenRouter says Claude through it is only guaranteed to work with Anthropic as the provider, so pin Anthropic first in your OpenRouter provider settings. OpenRouter marks its server tools as beta, and their behavior may change.
+
+### Switching providers when one runs out
+
+A client can carry fallback providers: when one account runs out of credit, the same request goes to the next provider and the client stays there.
+
+```rust,no_run
+use carpa::{Anthropic, KnownModel, MessageCreateParams};
+
+async fn ask(openrouter_key: &str, anthropic_key: String) -> Result<(), carpa::Error> {
+    let claude = Anthropic::openrouter(openrouter_key)?
+        .with_fallbacks([Anthropic::try_new(Some(anthropic_key))?]);
+    let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable52);
+    let reply = claude.send(&params).await?;
+    println!("{} answered by {}", reply.id, claude.active_base_url());
+    Ok(())
+}
+```
+
+- Order is priority: the client first, then the fallbacks in order.
+- It switches when the provider says the account is out of credit: HTTP 402 (Payment Required), any `billing_error`, Anthropic's 429 with `enforced_spend_limit_reached`, and Anthropic's 400 `invalid_request_error` whose message starts "Your credit balance is too low".
+- The switch is final. OpenRouter also answers 402 when one request needs more credit than is left, even if smaller requests could still pass. The client switches then too and does not come back.
+- The failed request is resent on the next provider, so nothing is lost.
+- The client, and clones made after `with_fallbacks`, stay on the new provider until the process restarts. `active_base_url()` says which one is live.
+- Only message requests (`send`, `stream` and the tool loop) switch. Batches, files and the other endpoints stay on the first provider, since their ids belong to one account.
+- Use `KnownModel` so each provider gets its own spelling of the model name.
+- OpenRouter-only tools (`openrouter:web_search`, `openrouter:web_fetch`) fail on an Anthropic provider.
+
+Each switch is logged; see [Tracing](#tracing) for the `provider_switch` event and the `provider` span field.
 
 ## Semantic search: turbopuffer
 
@@ -1154,7 +1183,7 @@ assert_eq!(micro_cents, 4_500_000);
 
 | Request option | Value | Effect | Priced as |
 |---|---|---|---|
-| `with_speed` | `InferenceSpeed::Fast` | fast mode, Opus 5.5 only | `KnownModel::fast_token_rates` |
+| `with_speed` | `InferenceSpeed::Fast` | fast mode, Opus 5.5 and Fable 5.2 only | `KnownModel::fast_token_rates` |
 | `with_inference_geo` | `"us"` | runs inference in the US | 1.1x |
 | `with_service_tier` | `ServiceTierChoice::Auto` | may use Priority Tier capacity | standard rates |
 
@@ -1185,7 +1214,7 @@ Each window holds `limit`, `remaining` and `reset`. The windows are:
 
 ### Tracing
 
-Every API call runs in a `carpa.request` tracing span. On `send` and `stream` the span records:
+Every API call runs in a `carpa.request` tracing span. It names its `provider`, the base URL the request goes to. A client with fallbacks adds `provider_index` (0 is the first provider) and `provider_count`. A request resent on a fallback gets one span per provider it tried, each with its own `request_completed` event. On `send` and `stream` the span records:
 
 - `request_id`
 - `http.status_code`
@@ -1200,6 +1229,10 @@ The crate also emits plain tracing events. Aggregate them with any subscriber. D
 | `carpa::usage` | `INFO` | `usage` | see below |
 | `carpa::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
 | `carpa::client` | `WARN` | `retry` | `error`, `attempt`, `backoff_seconds` |
+| `carpa::client` | `INFO` | `providers_configured` | `providers`, `provider_count` |
+| `carpa::client` | `WARN` | `provider_switch` | `operation`, `from`, `to`, `from_index`, `to_index`, `provider_count`, `reason`, `http.status_code`, `error_code`, `request_id` |
+| `carpa::client` | `DEBUG` | `provider_already_switched` | as `provider_switch` |
+| `carpa::client` | `ERROR` | `providers_exhausted` | `operation`, `provider`, `provider_count`, `http.status_code` |
 | `carpa::stream` | `TRACE` | `event` | |
 | `carpa::stream` | `TRACE` | `bytes` | `bytes` |
 | `carpa::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
@@ -1213,6 +1246,15 @@ The crate also emits plain tracing events. Aggregate them with any subscriber. D
 | `carpa::firecrawl` | `WARN` | "Retrying Firecrawl request" | `error`, `path`, `attempt`, `sleep_seconds` |
 
 Each `carpa::jev` event also carries `status`, `attempt`, `request_id` and `model`.
+
+The provider events cover fallback providers (see [Switching providers when one runs out](#switching-providers-when-one-runs-out)):
+
+- `providers_configured` fires on each `with_fallbacks` call and lists every base URL in priority order.
+- `provider_switch` fires once each time the client moves to the next provider. `from` and `to` are base URLs, `reason` is `out_of_credit`, and `request_id` is the one of the response that ran out. `error_code` appears only when the error carried one. Count these events to count switches.
+- `provider_already_switched` fires when a request in flight finds its provider out of credit after another request already moved the client on. The request is resent on the current provider.
+- `providers_exhausted` fires when the last provider is out of credit too, next to the usual failure log.
+
+A request that switches is not logged as an error: its first span is marked failed with the out-of-credit status, and the `provider_switch` warning tells the story. Keys never appear in these events.
 
 An API value this crate does not know, such as a new stop reason or content block type, is kept as the type's `Unknown` variant. An unknown stream event is skipped. Either is logged as a warning on `carpa::unknown` the first time each distinct value appears in the process, without its payload. The message reads "unknown API value; update carpa to read it". A constant `type` tag, such as `message` on a `Message`, is checked the same way: another value is logged and the reply still parses.
 

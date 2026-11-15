@@ -61,7 +61,7 @@ cargo run -p carpa-evals -- code-mode --budget-cents 300 [options]
 | Option | Default | Meaning |
 |---|---|---|
 | `--budget-cents N` | required | stop before a run once the Anthropic spend reaches N cents |
-| `--models A,B` | `sonnet-5-5` | models, with or without the `claude-` prefix: `opus-5-5`, `sonnet-5-5`, `haiku-5-5`, `fable-5-1` |
+| `--models A,B` | `sonnet-5-5` | models, with or without the `claude-` prefix: `opus-5-5`, `sonnet-5-5`, `haiku-5-5`, `fable-5-2`, `fable-5-1` |
 | `--repeat N` | 3 | runs per case, arm and model |
 | `--split S` | `dev` | `dev`, `holdout` or `all` |
 | `--cases ID,ID` | all in the split | only these case ids; an id that is unknown or outside `--split` is an error |

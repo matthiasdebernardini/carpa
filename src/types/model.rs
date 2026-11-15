@@ -31,6 +31,8 @@ pub enum KnownModel {
     ClaudeSonnet55,
     /// Claude Haiku 5.5 (released 2026-10-07)
     ClaudeHaiku55,
+    /// Claude Fable 5.2 (released 2026-11-09)
+    ClaudeFable52,
     /// Claude Fable 5.1
     ClaudeFable51,
 }
@@ -61,7 +63,7 @@ impl fmt::Display for Model {
 /// | $3             | 300,000          |
 /// | $15            | 1,500,000        |
 ///
-/// Rates from <https://platform.claude.com/docs/en/about-claude/pricing> as of 2026-10-19.
+/// Rates from <https://platform.claude.com/docs/en/about-claude/pricing> as of 2026-11-15.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TokenRates {
@@ -191,6 +193,27 @@ fn cache_writes(total: i32, breakdown: Option<CacheCreation>) -> (u64, u64) {
 }
 
 impl KnownModel {
+    /// Every known model.
+    pub const ALL: [KnownModel; 5] = [
+        KnownModel::ClaudeOpus55,
+        KnownModel::ClaudeSonnet55,
+        KnownModel::ClaudeHaiku55,
+        KnownModel::ClaudeFable52,
+        KnownModel::ClaudeFable51,
+    ];
+
+    /// The model's name on OpenRouter, such as `anthropic/claude-fable-5.2`.
+    #[must_use]
+    pub const fn openrouter_slug(&self) -> &'static str {
+        match self {
+            KnownModel::ClaudeOpus55 => "anthropic/claude-opus-5.5",
+            KnownModel::ClaudeSonnet55 => "anthropic/claude-sonnet-5.5",
+            KnownModel::ClaudeHaiku55 => "anthropic/claude-haiku-5.5",
+            KnownModel::ClaudeFable52 => "anthropic/claude-fable-5.2",
+            KnownModel::ClaudeFable51 => "anthropic/claude-fable-5.1",
+        }
+    }
+
     /// Prompt size above which Claude Haiku 5.5 bills the whole request at the higher tier.
     pub const HAIKU_55_TIER_THRESHOLD_TOKENS: u64 = 100_000;
 
@@ -219,6 +242,8 @@ impl KnownModel {
             cache_read,
         };
         match self {
+            // $8/$40, $10/$16, $0.20
+            KnownModel::ClaudeFable52 => rates(800_000, 4_000_000, 1_000_000, 1_600_000, 20_000),
             // $10/$50, $12.50/$20, $0.25
             KnownModel::ClaudeFable51 => rates(1_000_000, 5_000_000, 1_250_000, 2_000_000, 25_000),
             // $4/$20, $5/$8, $0.20
@@ -267,6 +292,7 @@ impl KnownModel {
         };
         match self {
             KnownModel::ClaudeOpus55 => rates(800_000, 4_000_000, 1_000_000, 1_600_000, 40_000),
+            KnownModel::ClaudeFable52 => rates(1_600_000, 8_000_000, 2_000_000, 3_200_000, 40_000),
             _ => None,
         }
     }
@@ -371,6 +397,7 @@ impl fmt::Display for KnownModel {
             KnownModel::ClaudeOpus55 => write!(f, "claude-opus-5-5"),
             KnownModel::ClaudeSonnet55 => write!(f, "claude-sonnet-5-5"),
             KnownModel::ClaudeHaiku55 => write!(f, "claude-haiku-5-5"),
+            KnownModel::ClaudeFable52 => write!(f, "claude-fable-5-2"),
             KnownModel::ClaudeFable51 => write!(f, "claude-fable-5-1"),
         }
     }
@@ -425,17 +452,33 @@ impl std::error::Error for ParseKnownModelError {}
 impl FromStr for KnownModel {
     type Err = ParseKnownModelError;
 
+    /// Parses an Anthropic model id or an OpenRouter name. A dated OpenRouter name such as
+    /// `anthropic/claude-fable-5.2-20261109` parses to the known model, so the date pin is
+    /// dropped: the model serializes back as `claude-fable-5-2`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "claude-opus-5-5" => Ok(KnownModel::ClaudeOpus55),
             "claude-sonnet-5-5" => Ok(KnownModel::ClaudeSonnet55),
             "claude-haiku-5-5" => Ok(KnownModel::ClaudeHaiku55),
+            "claude-fable-5-2" => Ok(KnownModel::ClaudeFable52),
             "claude-fable-5-1" => Ok(KnownModel::ClaudeFable51),
-            _ => Err(ParseKnownModelError {
+            _ => from_openrouter_slug(s).ok_or_else(|| ParseKnownModelError {
                 invalid_value: s.to_string(),
             }),
         }
     }
+}
+
+/// The model named by an OpenRouter name such as `anthropic/claude-fable-5.2`, optionally
+/// followed by a `-YYYYMMDD` date as in `anthropic/claude-fable-5.2-20261109`.
+fn from_openrouter_slug(s: &str) -> Option<KnownModel> {
+    let name = match s.rsplit_once('-') {
+        Some((name, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => s,
+    };
+    KnownModel::ALL
+        .into_iter()
+        .find(|model| model.openrouter_slug() == name)
 }
 
 impl FromStr for Model {
@@ -489,6 +532,7 @@ mod tests {
             (KnownModel::ClaudeOpus55, "claude-opus-5-5"),
             (KnownModel::ClaudeSonnet55, "claude-sonnet-5-5"),
             (KnownModel::ClaudeHaiku55, "claude-haiku-5-5"),
+            (KnownModel::ClaudeFable52, "claude-fable-5-2"),
             (KnownModel::ClaudeFable51, "claude-fable-5-1"),
         ] {
             let model = Model::Known(known);
@@ -498,6 +542,60 @@ mod tests {
                 model
             );
             assert_eq!(id.parse::<KnownModel>(), Ok(known));
+        }
+    }
+
+    #[test]
+    fn all_lists_every_model_once() {
+        for (index, model) in KnownModel::ALL.into_iter().enumerate() {
+            // A new variant fails to compile here: add it to the match and to `KnownModel::ALL`.
+            let position = match model {
+                KnownModel::ClaudeOpus55 => 0,
+                KnownModel::ClaudeSonnet55 => 1,
+                KnownModel::ClaudeHaiku55 => 2,
+                KnownModel::ClaudeFable52 => 3,
+                KnownModel::ClaudeFable51 => 4,
+            };
+            assert_eq!(position, index, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn openrouter_slugs_parse_back() {
+        for known in [
+            KnownModel::ClaudeOpus55,
+            KnownModel::ClaudeSonnet55,
+            KnownModel::ClaudeHaiku55,
+            KnownModel::ClaudeFable52,
+            KnownModel::ClaudeFable51,
+        ] {
+            assert_eq!(known.openrouter_slug().parse::<KnownModel>(), Ok(known));
+        }
+        for (id, known) in [
+            (
+                "anthropic/claude-fable-5.2-20261109",
+                KnownModel::ClaudeFable52,
+            ),
+            (
+                "anthropic/claude-haiku-5.5-20261007",
+                KnownModel::ClaudeHaiku55,
+            ),
+        ] {
+            let model: Model = serde_json::from_str(&format!("\"{id}\"")).unwrap();
+            assert_eq!(model, Model::Known(known));
+            // Serialization stays the Anthropic id.
+            assert_eq!(model.to_string(), known.to_string());
+        }
+    }
+
+    #[test]
+    fn unknown_openrouter_names_are_custom() {
+        for id in [
+            "anthropic/claude-unknown-9.9",
+            "anthropic/claude-fable-5.2-2026",
+        ] {
+            let model: Model = serde_json::from_str(&format!("\"{id}\"")).unwrap();
+            assert_eq!(model, Model::Custom(id.to_string()));
         }
     }
 
@@ -555,6 +653,18 @@ mod tests {
             cache_write_1h: w1,
             cache_read: read,
         }
+    }
+
+    #[test]
+    fn token_rates_fable_52() {
+        assert_eq!(
+            KnownModel::ClaudeFable52.token_rates(),
+            rates(800_000, 4_000_000, 1_000_000, 1_600_000, 20_000)
+        );
+        assert_eq!(
+            KnownModel::ClaudeFable52.fast_token_rates(),
+            Some(rates(1_600_000, 8_000_000, 2_000_000, 3_200_000, 40_000))
+        );
     }
 
     #[test]
