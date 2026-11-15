@@ -1,6 +1,6 @@
 [package]
 name = "carpa"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Matthias Debernardini <matthias@nashvilleautomation.io>"]
 edition = "2024"
 description = "Superintelligence for Topcoat apps: Claude, Jev and Firecrawl"
